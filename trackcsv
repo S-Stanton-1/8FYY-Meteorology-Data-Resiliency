@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""
+Cyclone track from WRF: minimum SLP each model time using wrf-python.
+
+- Uses netCDF4.Dataset (most compatible with wrf-python).
+- Iterates over ALL Time indices within each wrfout file.
+- Tracks the minimum SLP within a Madagascar-region bbox.
+- Optional storm-following radius window to prevent jumps.
+
+Inputs (same directory as script):
+  wrfout_d01_*   (edit PATTERN if needed)
+
+Output:
+  track_min_slp.csv
+
+Columns:
+  time, lat, lon, min_slp_hpa, i, j, source_file
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+import numpy as np
+import pandas as pd
+
+from netCDF4 import Dataset
+from wrf import getvar, latlon_coords
+
+
+# ---------------- user knobs ----------------
+PATTERN = "wrfout_d01_*"
+OUTCSV = "track_min_slp.csv"
+
+# Madagascar-focused bbox (lon_min, lon_max, lat_min, lat_max)
+BBOX = (38.0, 62.0, -32.0, -8.0)
+
+# Storm-following radius in degrees (after first fix). Set to None to disable.
+RADIUS_DEG = 4.0
+# ------------------------------------------
+
+
+def bbox_mask(lat2d: np.ndarray, lon2d: np.ndarray) -> np.ndarray:
+    lon_min, lon_max, lat_min, lat_max = BBOX
+    return (lon2d >= lon_min) & (lon2d <= lon_max) & (lat2d >= lat_min) & (lat2d <= lat_max)
+
+
+def radius_mask(lat2d: np.ndarray, lon2d: np.ndarray, clat: float, clon: float, rdeg: float) -> np.ndarray:
+    return (lat2d - clat) ** 2 + (lon2d - clon) ** 2 <= rdeg ** 2
+
+
+def decode_time_from_nc(nc: Dataset, it: int) -> pd.Timestamp:
+    times = nc.variables["Times"]  # (Time, DateStrLen)
+    row = times[it, :]
+    # row is a char array; convert to bytes then decode
+    try:
+        s = row.tobytes().decode("utf-8", errors="ignore").strip()
+    except Exception:
+        # fallback
+        s = "".join(str(x) for x in row[:]).strip()
+
+    # Clean any nulls
+    s = s.replace("\x00", "").strip()
+
+    t = pd.to_datetime(s, format="%Y-%m-%d_%H:%M:%S", errors="coerce")
+    if pd.isna(t):
+        t = pd.to_datetime(s.replace("_", " "), errors="raise")
+    return t
+
+
+def main() -> int:
+    script_dir = Path(__file__).resolve().parent
+    files = sorted(script_dir.glob(PATTERN))
+    if not files:
+        raise FileNotFoundError(f"No files matched {PATTERN!r} in {str(script_dir)!r}")
+
+    records = []
+    prev_center = None  # (lat, lon)
+
+    for fpath in files:
+        nc = Dataset(str(fpath), mode="r")
+
+        if "Times" not in nc.variables:
+            nc.close()
+            raise KeyError(f"{fpath.name} missing Times variable")
+
+        ntime = len(nc.dimensions["Time"]) if "Time" in nc.dimensions else 1
+
+        for it in range(ntime):
+            t = decode_time_from_nc(nc, it)
+
+            # SLP in hPa
+            slp = getvar(nc, "slp", timeidx=it)  # xarray DataArray-like
+            lats, lons = latlon_coords(slp)
+
+            slp2d = np.array(slp.values, dtype=float)
+            lat2d = np.array(lats.values, dtype=float)
+            lon2d = np.array(lons.values, dtype=float)
+
+            # base bbox mask
+            mask = bbox_mask(lat2d, lon2d)
+
+            # optional storm-following radius
+            if (RADIUS_DEG is not None) and (prev_center is not None):
+                local = radius_mask(lat2d, lon2d, prev_center[0], prev_center[1], RADIUS_DEG)
+                mask_local = mask & local
+                if np.isfinite(slp2d[mask_local]).any():
+                    mask = mask_local  # use local window if it has valid points
+
+            slp_masked = np.where(mask, slp2d, np.nan)
+
+            if not np.isfinite(slp_masked).any():
+                records.append(
+                    dict(
+                        time=t,
+                        lat=np.nan,
+                        lon=np.nan,
+                        min_slp_hpa=np.nan,
+                        i=np.nan,
+                        j=np.nan,
+                        source_file=fpath.name,
+                    )
+                )
+                continue
+
+            j, i = np.unravel_index(np.nanargmin(slp_masked), slp_masked.shape)
+            clat = float(lat2d[j, i])
+            clon = float(lon2d[j, i])
+            prev_center = (clat, clon)
+
+            records.append(
+                dict(
+                    time=t,
+                    lat=clat,
+                    lon=clon,
+                    min_slp_hpa=float(slp_masked[j, i]),
+                    i=int(i),
+                    j=int(j),
+                    source_file=fpath.name,
+                )
+            )
+
+        nc.close()
+
+    df = pd.DataFrame.from_records(records).sort_values("time")
+
+    # Drop duplicate timestamps if multiple files overlap
+    df = df.drop_duplicates(subset=["time"], keep="last").reset_index(drop=True)
+
+    df["time"] = pd.to_datetime(df["time"]).dt.strftime("%Y-%m-%d_%H:%M:%S")
+
+    outpath = script_dir / OUTCSV
+    df.to_csv(outpath, index=False, float_format="%.3f")
+
+    print(f"Wrote: {outpath}")
+    print(f"Rows: {len(df)}")
+    print(f"Unique lat: {df['lat'].nunique()} | Unique lon: {df['lon'].nunique()}")
+
+    if df["lat"].nunique() <= 2 and df["lon"].nunique() <= 2:
+        print("WARNING: Track still nearly stationary. Most common causes:")
+        print("  - Storm center is outside BBOX; adjust BBOX.")
+        print("  - RADIUS_DEG too small; increase to 6–8.")
+        print("  - You're reading the wrong files; verify PATTERN and directory contents.")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+

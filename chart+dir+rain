@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""
+Hourly wrfout -> wide CSV at ICAO points:
+  • 10 m wind speed (m/s)
+  • 10 m wind direction (deg, meteorological: FROM direction, clockwise from north)
+  • 1-hr precipitation (mm)  [ (RAINC+RAINNC)[t] - (RAINC+RAINNC)[t-1] ]
+  • 3-hr precipitation (mm)  [ (RAINC+RAINNC)[t] - (RAINC+RAINNC)[t-3] ]
+  • freezing level (m MSL and m AGL)
+
+NaN handling:
+  • Any missing precip difference → 0
+  • Any negative precip difference → 0
+
+Auto-discovers wrfout files in the SAME directory as this script.
+
+Output:
+  wrf_diag_wide.csv
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import xarray as xr
+
+
+STATIONS = {
+    "FMNA": (-12.3494, 49.2917),
+    "FMNN": (-13.3121, 48.3148),
+    "FMNM": (-15.6668, 46.3512),
+    "FMMI": (-18.7969, 47.4788),
+    "FMMS": (-17.0939, 49.8158),
+    "FMMT": (-18.1135, 49.3923),
+    "FMSD": (-25.0381, 46.9561),
+    "FMEE": (-20.8901, 55.5189),
+    "FMEP": (-21.3194, 55.4225),
+}
+
+REQUIRED = [
+    "XLAT", "XLONG", "HGT",
+    "U10", "V10",
+    "RAINC", "RAINNC",
+    "T", "P", "PB", "PH", "PHB",
+    "Times",
+]
+
+
+def require_vars(ds, names):
+    missing = [n for n in names if n not in ds.variables]
+    if missing:
+        raise KeyError(f"Missing required variables: {missing}")
+
+
+def squeeze_time(da):
+    return da.isel(Time=0) if "Time" in da.dims else da
+
+
+def decode_times(ds):
+    arr = ds["Times"].values
+    row = arr[0] if arr.ndim > 1 else arr
+
+    if getattr(row.dtype, "kind", None) == "S":
+        s = b"".join(row.tolist()).decode("utf-8", errors="ignore").strip()
+    else:
+        s = "".join(
+            str(c) if not isinstance(c, (bytes, np.bytes_))
+            else c.decode("utf-8", errors="ignore")
+            for c in np.ravel(row)
+        ).strip()
+
+    t = pd.to_datetime(s, format="%Y-%m-%d_%H:%M:%S", errors="coerce")
+    if pd.isna(t):
+        t = pd.to_datetime(s.replace("_", " "), errors="raise")
+    return t
+
+
+def nearest_ij(lat2d, lon2d, lat, lon):
+    d2 = (lat2d - lat) ** 2 + (lon2d - lon) ** 2
+    j, i = np.unravel_index(np.nanargmin(d2), d2.shape)
+    return int(j), int(i)
+
+
+def temperature_k(ds):
+    theta = squeeze_time(ds["T"]) + 300.0
+    p = squeeze_time(ds["P"] + ds["PB"])
+    return theta * (p / 100000.0) ** (287.0 / 1004.0)
+
+
+def height_msl_mass(ds):
+    g = 9.81
+    z_stag = squeeze_time(ds["PH"] + ds["PHB"]) / g
+    z_mass = 0.5 * (
+        z_stag.isel(bottom_top_stag=slice(0, -1)) +
+        z_stag.isel(bottom_top_stag=slice(1, None))
+    )
+    return z_mass.rename({"bottom_top_stag": "bottom_top"})
+
+
+def freezing_level(z_msl, t_k, terrain_m):
+    t0 = 273.15
+    m = np.isfinite(z_msl) & np.isfinite(t_k)
+    if m.sum() < 2:
+        return np.nan, np.nan
+
+    z = z_msl[m]
+    t = t_k[m]
+
+    above = t > t0
+    idx = np.where(above[:-1] & (~above[1:]))[0]
+    if idx.size == 0:
+        return np.nan, np.nan
+
+    k = int(idx[0])
+    z1, z2 = float(z[k]), float(z[k + 1])
+    t1, t2 = float(t[k]), float(t[k + 1])
+
+    if (t2 == t1) or (z2 == z1):
+        return np.nan, np.nan
+
+    frac = (t0 - t1) / (t2 - t1)
+    zf = z1 + frac * (z2 - z1)
+    return float(zf), float(zf - terrain_m)
+
+
+def wind_dir_from_uv(u, v):
+    """
+    Meteorological wind direction (degrees FROM which the wind blows),
+    clockwise from north, using u (eastward) and v (northward).
+    """
+    return (np.degrees(np.arctan2(-u, -v)) + 360.0) % 360.0
+
+
+def main():
+    script_dir = Path(__file__).resolve().parent
+    files = sorted(script_dir.glob("wrfout_d01_*"))
+    if not files:
+        raise FileNotFoundError("No wrfout_d01_* files found in script directory")
+
+    # Grid + station indices
+    with xr.open_dataset(files[0], decode_times=False) as ds0:
+        lat2d = squeeze_time(ds0["XLAT"]).values
+        lon2d = squeeze_time(ds0["XLONG"]).values
+        station_ij = {
+            icao: nearest_ij(lat2d, lon2d, slat, slon)
+            for icao, (slat, slon) in STATIONS.items()
+        }
+
+    records = []
+
+    for fpath in files:
+        with xr.open_dataset(fpath, decode_times=False) as ds:
+            require_vars(ds, REQUIRED)
+            t = decode_times(ds)
+
+            U10 = squeeze_time(ds["U10"])
+            V10 = squeeze_time(ds["V10"])
+
+            wspd10 = np.sqrt(U10**2 + V10**2)
+            wdir10 = wind_dir_from_uv(U10, V10)
+
+            terrain = squeeze_time(ds["HGT"])
+            ptotal = squeeze_time(ds["RAINC"] + ds["RAINNC"])
+
+            tk = temperature_k(ds)
+            z_msl = height_msl_mass(ds)
+
+            rec = {"time": t}
+
+            for icao, (j, i) in station_ij.items():
+                terr = float(terrain.values[j, i])
+
+                rec[f"{icao}_wspd10_ms"] = float(wspd10.values[j, i])
+                rec[f"{icao}_wdir10_deg"] = float(wdir10.values[j, i])
+
+                # keep running total for now; we will difference later
+                rec[f"{icao}_ptotal_mm"] = float(ptotal.values[j, i])
+
+                z_prof = z_msl.values[:, j, i]
+                t_prof = tk.values[:, j, i]
+                frz_msl, frz_agl = freezing_level(z_prof, t_prof, terr)
+                rec[f"{icao}_frz_msl_m"] = frz_msl
+                rec[f"{icao}_frz_agl_m"] = frz_agl
+
+            records.append(rec)
+
+    df = pd.DataFrame(records).sort_values("time").reset_index(drop=True)
+
+    # Precip differences from running total
+    for icao in STATIONS.keys():
+        total_col = f"{icao}_ptotal_mm"
+
+        p1_col = f"{icao}_pcp1hr_mm"
+        p3_col = f"{icao}_pcp3hr_mm"
+
+        # 1-hour precip: 1-step difference
+        df[p1_col] = df[total_col] - df[total_col].shift(1)
+        df[p1_col] = df[p1_col].fillna(0.0)
+        df.loc[df[p1_col] < 0, p1_col] = 0.0
+
+        # 3-hour precip: 3-step difference
+        df[p3_col] = df[total_col] - df[total_col].shift(3)
+        df[p3_col] = df[p3_col].fillna(0.0)
+        df.loc[df[p3_col] < 0, p3_col] = 0.0
+
+        # drop running total
+        df.drop(columns=[total_col], inplace=True)
+
+    df["time"] = df["time"].dt.strftime("%Y-%m-%d_%H:%M:%S")
+
+    out_csv = script_dir / "wrf_diag_wide.csv"
+    df.to_csv(out_csv, index=False, float_format="%.3f")
+
+    print(f"Wrote: {out_csv}")
+    print(f"{len(df)} hourly times processed.")
+
+
+if __name__ == "__main__":
+    main()
