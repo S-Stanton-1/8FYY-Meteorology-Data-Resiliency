@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""
+ONE figure with 6 subplots (one per station) comparing 10 m WRF wind direction
+from 4 runs against METAR-observed wind direction.
+
+Stations plotted (subplots):
+  FMMI, FMMT, FMEE, FMSD, FMNM, FMNA
+
+WRF inputs (wide CSVs; same directory as script):
+  fulldata.csv or fulldata+dir.csv
+  noinsitu.csv or noinsitu+dir.csv
+  nosat.csv or nosat+dir.csv
+  noda.csv or noda+dir.csv
+
+Each WRF CSV must contain:
+  time column + <ICAO>_wdir10_deg columns
+
+METAR input (Excel; same directory as script):
+  metar.xlsx
+Uses:
+  station, time_utc, direction
+
+Output:
+  metar_vs_wrf_wdir_6stations.png
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+
+# -----------------------------
+# Config
+# -----------------------------
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+WRF_RUNS = {
+    "Full Data": ["fulldata+dir.csv", "fulldata.csv"],
+    "No In-situ": ["noinsitu+dir.csv", "noinsitu.csv"],
+    "No Sat": ["nosat+dir.csv", "nosat.csv"],
+    "No DA": ["noda+dir.csv", "noda.csv"],
+}
+
+METAR_XLSX = "metar.xlsx"
+
+STATIONS = ["FMMI", "FMMT", "FMEE", "FMSD", "FMNM", "FMNA"]
+
+OUTFIG = "metar_vs_wrf_wdir_6stations.png"
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def parse_wrf_time(series: pd.Series) -> pd.Series:
+    s = series.astype(str).str.strip()
+
+    t = pd.to_datetime(s, format="%Y-%m-%d_%H:%M:%S", errors="coerce")
+
+    mask = t.isna()
+    if mask.any():
+        t2 = pd.to_datetime(s[mask], format="%Y-%m-%d %H:%M:%S", errors="coerce")
+        t.loc[mask] = t2
+
+    mask = t.isna()
+    if mask.any():
+        t3 = pd.to_datetime(s[mask].str.replace("_", " ", regex=False), errors="coerce")
+        t.loc[mask] = t3
+
+    if t.isna().any():
+        bad = s[t.isna()].iloc[:5].tolist()
+        raise ValueError("Failed to parse some timestamps in 'time'. Examples:\n  " + "\n  ".join(bad))
+
+    return t
+
+
+def pick_existing(candidates: list[str]) -> str:
+    for c in candidates:
+        if (SCRIPT_DIR / c).exists():
+            return c
+    raise FileNotFoundError(f"None of these files were found in {SCRIPT_DIR}: {candidates}")
+
+
+def load_wrf_csv(fname: str) -> pd.DataFrame:
+    path = SCRIPT_DIR / fname
+    df = pd.read_csv(path)
+    if "time" not in df.columns:
+        raise KeyError(f"{fname} missing 'time' column")
+
+    df["time"] = parse_wrf_time(df["time"])
+    df = df.sort_values("time").set_index("time")
+    return df
+
+
+def load_metar_xlsx() -> pd.DataFrame:
+    path = SCRIPT_DIR / METAR_XLSX
+    if not path.exists():
+        raise FileNotFoundError(f"Missing METAR Excel file: {path}")
+
+    df = pd.read_excel(path)
+
+    required = ["station", "time_utc", "direction"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise RuntimeError(f"metar.xlsx missing required columns: {missing}\nColumns present: {list(df.columns)}")
+
+    out = pd.DataFrame({
+        "time": pd.to_datetime(df["time_utc"], errors="coerce"),
+        "icao": df["station"].astype(str).str.strip().str.upper(),
+        "wdir_deg": pd.to_numeric(df["direction"], errors="coerce"),
+    })
+
+    out = out.dropna(subset=["time"]).sort_values("time")
+    return out
+
+
+def break_wrap(series_deg: np.ndarray, jump_deg: float = 180.0) -> np.ndarray:
+    """
+    Insert NaNs at wrap-around jumps so lines don't draw across 0/360.
+    """
+    y = np.asarray(series_deg, dtype=float).copy()
+    if y.size < 2:
+        return y
+
+    dy = np.abs(np.diff(y))
+    y[1:][dy > jump_deg] = np.nan
+    return y
+
+
+# -----------------------------
+# Plot
+# -----------------------------
+def main() -> None:
+    # Load WRF runs
+    wrf_data = {}
+    for label, candidates in WRF_RUNS.items():
+        fname = pick_existing(candidates)
+        wrf_data[label] = load_wrf_csv(fname)
+        print(f"Loaded {label}: {fname}")
+
+    # Validate required station direction columns exist
+    for stn in STATIONS:
+        col = f"{stn}_wdir10_deg"
+        for label, df in wrf_data.items():
+            if col not in df.columns:
+                raise KeyError(f"Missing column {col!r} in {label} CSV")
+
+    # Load METAR
+    metar = load_metar_xlsx()
+
+    # 6 subplots: 3x2 grid
+    fig, axes = plt.subplots(nrows=3, ncols=2, figsize=(15, 10), sharex=True, sharey=True)
+    axes = axes.ravel()
+
+        # 6 subplots: 3x2 grid
+    fig, axes = plt.subplots(
+        nrows=3, ncols=2,
+        figsize=(15, 10),
+        sharex=True,
+        sharey=True
+    )
+    axes = axes.ravel()
+
+    for idx, stn in enumerate(STATIONS):
+        ax = axes[idx]
+        wrf_col = f"{stn}_wdir10_deg"
+
+        # --- WRF trials as scatter ---
+        for label, df in wrf_data.items():
+            ax.scatter(
+                df.index,
+                df[wrf_col].values,
+                s=12,
+                alpha=0.5,
+                label=label,
+            )
+
+        # --- METAR truth ---
+        m = metar[metar["icao"] == stn]
+        ax.scatter(
+            m["time"].values,
+            m["wdir_deg"].values,
+            s=20,
+            marker="o",
+            edgecolors="black",
+            linewidths=0.5,
+            label="METAR",
+            zorder=4,
+        )
+
+        ax.set_title(stn)
+        ax.set_ylim(0, 360)
+        ax.set_yticks(np.arange(0, 361, 45))
+        ax.grid(True)
+
+    # ---- 6-hour ticks anchored to 00/06/12/18Z + x-limits anchored to 6h ----
+    locator = mdates.HourLocator(byhour=[0, 6, 12, 18])
+    formatter = mdates.DateFormatter("%m-%d %HZ")
+
+    all_times = []
+    for df in wrf_data.values():
+        if len(df.index) > 0:
+            all_times.append(df.index)
+    if len(metar) > 0:
+        all_times.append(metar["time"])
+
+    tmin = min(x.min() for x in all_times)
+    tmax = max(x.max() for x in all_times)
+
+    xmin = pd.Timestamp(tmin).floor("6h")
+    xmax = pd.Timestamp(tmax).ceil("6h")
+
+    for ax in axes[:len(STATIONS)]:
+        ax.xaxis.set_major_locator(locator)
+        ax.xaxis.set_major_formatter(formatter)
+        ax.set_xlim(xmin, xmax)
+
+    fig.autofmt_xdate()
+
+    # Figure-level legend
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        ncol=5,
+        bbox_to_anchor=(0.5, 0.995),
+        frameon=True,
+    )
+
+    fig.supxlabel("Time (UTC)")
+    fig.supylabel("10 m Wind Direction (deg, FROM)")
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+
+    outpath = SCRIPT_DIR / OUTFIG
+    fig.savefig(outpath, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"Saved: {outpath}")
+
+
+if __name__ == "__main__":
+    main()

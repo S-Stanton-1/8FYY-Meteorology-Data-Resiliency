@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+"""
+Ogimet getmetar for all Madagascar ICAOs (prefix FM) -> decode -> Excel/CSV.
+
+pip install pandas requests metar
+Optional (for Excel):
+  pip install openpyxl
+"""
+
+from __future__ import annotations
+
+import math
+import warnings
+from io import StringIO
+from typing import Any
+
+import pandas as pd
+import requests
+from metar import Metar
+
+
+import sys
+import requests
+import pandas as pd
+import matplotlib.pyplot as plt
+
+OGIMET_GETMETAR_URL = "https://www.ogimet.com/cgi-bin/getmetar"
+
+
+def fetch_ogimet_metar_csv(begin: str, end: str, icao_prefix: str, timeout_s: int = 60) -> pd.DataFrame:
+    params = {
+        "begin": begin,
+        "end": end,
+        "icao": icao_prefix,  # prefix filter: FM for Madagascar
+        "lang": "eng",
+        "header": "yes",
+    }
+    r = requests.get(OGIMET_GETMETAR_URL, params=params, timeout=timeout_s)
+    r.raise_for_status()
+
+    text = r.text.strip()
+    if not text:
+        return pd.DataFrame()
+
+    df = pd.read_csv(StringIO(text))
+    df.columns = [c.strip() for c in df.columns]
+    return df
+
+
+def detect_schema(df: pd.DataFrame) -> dict[str, str]:
+    cols = set(df.columns)
+
+    if {"ICAOIND", "YEAR", "MONTH", "DAY", "HOUR", "MIN", "REPORT"}.issubset(cols):
+        return dict(station="ICAOIND", y="YEAR", mo="MONTH", d="DAY", h="HOUR", mi="MIN", rep="REPORT")
+
+    if {"ESTACION", "ANO", "MES", "DIA", "HORA", "MINUTO", "PARTE"}.issubset(cols):
+        return dict(station="ESTACION", y="ANO", mo="MES", d="DIA", h="HORA", mi="MINUTO", rep="PARTE")
+
+    raise KeyError(f"Unrecognized Ogimet CSV headers. Columns present: {list(df.columns)}")
+
+
+def add_time_utc(df: pd.DataFrame, s: dict[str, str]) -> pd.DataFrame:
+    df = df.copy()
+    df["time_utc"] = pd.to_datetime(
+        df[[s["y"], s["mo"], s["d"], s["h"], s["mi"]]].rename(
+            columns={s["y"]: "year", s["mo"]: "month", s["d"]: "day", s["h"]: "hour", s["mi"]: "minute"}
+        ),
+        errors="coerce",
+        utc=True,
+    )
+    return df
+
+
+def saturation_vapor_pressure_hpa(T_c: float) -> float:
+    return 6.112 * math.exp((17.67 * T_c) / (T_c + 243.5))
+
+
+def rh_from_t_td(T_c: float | None, Td_c: float | None) -> float | None:
+    if T_c is None or Td_c is None:
+        return None
+    es = saturation_vapor_pressure_hpa(T_c)
+    e = saturation_vapor_pressure_hpa(Td_c)
+    return max(0.0, min(100.0, 100.0 * e / es))
+
+
+def safe_float(x: Any) -> float | None:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def decode_metar_row(metar_text: str) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "metar_raw": metar_text,
+        "wind_dir_deg": None,
+        "wind_speed_kt": None,
+        "wind_gust_kt": None,
+        "vis_m": None,
+        "temp_c": None,
+        "dewpoint_c": None,
+        "rh_pct": None,
+        "altimeter_inhg": None,
+        "sea_level_pressure_hpa": None,
+        "wx": None,
+        "clouds": None,
+        "decode_error": None,
+    }
+
+    try:
+        # Some Ogimet reports contain odd tokens like "CHECK TEXT"; do not crash
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            m = Metar.Metar(metar_text, strict=False)
+
+        if m.wind_dir is not None:
+            out["wind_dir_deg"] = safe_float(m.wind_dir.value())
+        if m.wind_speed is not None:
+            out["wind_speed_kt"] = safe_float(m.wind_speed.value("KT"))
+        if getattr(m, "wind_gust", None) is not None:
+            out["wind_gust_kt"] = safe_float(m.wind_gust.value("KT"))
+
+        if m.vis is not None:
+            try:
+                out["vis_m"] = safe_float(m.vis.value("M"))
+            except Exception:
+                out["vis_m"] = safe_float(m.vis.value())
+
+        if m.temp is not None:
+            out["temp_c"] = safe_float(m.temp.value("C"))
+        if m.dewpt is not None:
+            out["dewpoint_c"] = safe_float(m.dewpt.value("C"))
+
+        out["rh_pct"] = rh_from_t_td(out["temp_c"], out["dewpoint_c"])
+
+        if m.press is not None:
+            try:
+                out["sea_level_pressure_hpa"] = safe_float(m.press.value("HPA"))
+            except Exception:
+                out["sea_level_pressure_hpa"] = safe_float(m.press.value())
+
+        if getattr(m, "altim", None) is not None:
+            try:
+                out["altimeter_inhg"] = safe_float(m.altim.value("IN"))
+            except Exception:
+                out["altimeter_inhg"] = safe_float(m.altim.value())
+
+        if getattr(m, "weather", None):
+            out["wx"] = " ".join([str(w) for w in m.weather]) if m.weather else None
+        if getattr(m, "sky", None):
+            out["clouds"] = " ".join([str(s) for s in m.sky]) if m.sky else None
+
+    except Exception as e:
+        out["decode_error"] = str(e)
+
+    return out
+
+
+def write_outputs(df: pd.DataFrame, prefix: str) -> None:
+    if df.empty:
+        print("No METAR rows returned for the requested filter/time window.")
+        return
+
+    # Excel cannot store timezone-aware datetimes; convert to naive UTC
+    if "time_utc" in df.columns:
+        # time_utc is UTC tz-aware; remove tz while keeping UTC clock time
+        df = df.copy()
+        df["time_utc"] = df["time_utc"].dt.tz_convert(None)
+
+    station_col = "station_icao"
+    summary = (
+        df.groupby(station_col)
+        .agg(
+            n_obs=("time_utc", "count"),
+            first_time=("time_utc", "min"),
+            last_time=("time_utc", "max"),
+            n_with_temp=("temp_c", lambda x: x.notna().sum()),
+            n_with_dewpt=("dewpoint_c", lambda x: x.notna().sum()),
+            n_with_wind=("wind_speed_kt", lambda x: x.notna().sum()),
+            n_decode_errors=("decode_error", lambda x: x.notna().sum()),
+        )
+        .sort_values("n_obs", ascending=False)
+        .reset_index()
+    )
+
+    # Try Excel; fallback to CSV if openpyxl missing or any Excel write issue occurs
+    try:
+        import openpyxl  # noqa: F401
+
+        out_xlsx = f"{prefix}.xlsx"
+        with pd.ExcelWriter(out_xlsx, engine="openpyxl") as xw:
+            df.to_excel(xw, sheet_name="all_metars_decoded", index=False)
+            summary.to_excel(xw, sheet_name="station_summary", index=False)
+        print(f"Wrote Excel: {out_xlsx}")
+    except Exception as e:
+        df.to_csv(f"{prefix}.csv", index=False)
+        summary.to_csv(f"{prefix}_station_summary.csv", index=False)
+        print(f"Excel write failed ({e}). Wrote CSVs instead: {prefix}.csv and {prefix}_station_summary.csv")
+
+
+if __name__ == "__main__":
+    begin = "202302200000"
+    end = "202302230000"
+    icao_prefix = "FM"
+
+    print(f"Fetching Ogimet METARs for ICAO prefix={icao_prefix}, {begin} -> {end} ...")
+    raw = fetch_ogimet_metar_csv(begin, end, icao_prefix=icao_prefix)
+
+    if raw.empty:
+        print("No rows returned at all (raw query empty).")
+        raise SystemExit(0)
+
+    schema = detect_schema(raw)
+    raw = add_time_utc(raw, schema)
+
+    # Normalize names
+    raw = raw.rename(columns={schema["station"]: "station_icao", schema["rep"]: "report_text"})
+
+    decoded = pd.DataFrame([decode_metar_row(m) for m in raw["report_text"].astype(str).tolist()])
+    out = pd.concat([raw, decoded], axis=1)
+
+    prefix = f"madagascar_FM_metar_decoded_{begin}_{end}"
+    write_outputs(out, prefix=prefix)
+
+
+
+"""
+Plot ICAO stations on a map (Madagascar region), labelled.
+
+Data source: OurAirports airports.csv. :contentReference[oaicite:1]{index=1}
+
+Dependencies:
+  pip install pandas requests matplotlib
+Optional (better map):
+  pip install cartopy
+"""
+
+
+
+# --- USER INPUT: your ICAO stations ---
+ICAOS = [
+    "FMCZ",
+    "FMEE",
+    "FMEP",
+    "FMMI",
+    "FMNM",
+    "FMMT",
+    "FMMS",
+    "FMNA",
+    "FMNN",
+    "FMSD",
+]
+
+# OurAirports airports.csv (updated daily)
+OURAIRPORTS_CSV_URL = "https://ourairports.com/airports.csv"
+
+OUT_PNG = "madagascar_metar_stations.png"
+
+
+def load_airport_coords(icaos: list[str]) -> pd.DataFrame:
+    r = requests.get(OURAIRPORTS_CSV_URL, timeout=120)
+    r.raise_for_status()
+
+    # Read CSV from bytes
+    from io import StringIO
+    df = pd.read_csv(StringIO(r.text))
+
+    # OurAirports uses 'ident' for ICAO identifier when available
+    keep = df[df["ident"].isin(icaos)][
+        ["ident", "name", "latitude_deg", "longitude_deg", "elevation_ft", "municipality", "iso_country"]
+    ].copy()
+
+    # Basic validation
+    missing = sorted(set(icaos) - set(keep["ident"].tolist()))
+    if missing:
+        print(f"WARNING: {len(missing)} ICAO codes not found in OurAirports airports.csv: {missing}")
+
+    keep = keep.dropna(subset=["latitude_deg", "longitude_deg"])
+    keep = keep.sort_values("ident")
+    return keep
+
+
+def plot_with_cartopy(df: pd.DataFrame) -> None:
+    import cartopy.crs as ccrs
+    import cartopy.feature as cfeature
+
+    proj = ccrs.PlateCarree()
+    fig = plt.figure(figsize=(9, 10))
+    ax = plt.axes(projection=proj)
+
+    # Set extent with a little padding around points (or default Madagascar region)
+    pad = 2.0
+    if len(df) >= 1:
+        minlon, maxlon = df["longitude_deg"].min(), df["longitude_deg"].max()
+        minlat, maxlat = df["latitude_deg"].min(), df["latitude_deg"].max()
+        ax.set_extent([minlon - pad, maxlon + pad, minlat - pad, maxlat + pad], crs=proj)
+    else:
+        ax.set_extent([42, 52, -27, -10], crs=proj)
+
+    ax.add_feature(cfeature.COASTLINE, linewidth=0.8)
+    ax.add_feature(cfeature.BORDERS, linewidth=0.6)
+    ax.add_feature(cfeature.LAND, alpha=0.2)
+    ax.add_feature(cfeature.OCEAN, alpha=0.1)
+
+    ax.gridlines(draw_labels=True, linewidth=0.3, linestyle="--")
+
+    ax.scatter(
+        df["longitude_deg"],
+        df["latitude_deg"],
+        transform=proj,
+        s=35,
+        marker="o",
+        zorder=3,
+    )
+
+    # Label each station (small offset so text isn't directly on the marker)
+    for _, row in df.iterrows():
+        ax.text(
+            row["longitude_deg"] + 0.08,
+            row["latitude_deg"] + 0.08,
+            row["ident"],
+            transform=proj,
+            fontsize=9,
+            zorder=4,
+        )
+
+    ax.set_title("Madagascar-region METAR stations (ICAO)")
+    plt.tight_layout()
+    plt.savefig(OUT_PNG, dpi=200)
+    print(f"Wrote {OUT_PNG}")
+
+
+def plot_fallback(df: pd.DataFrame) -> None:
+    fig = plt.figure(figsize=(8, 9))
+    ax = plt.gca()
+
+    ax.scatter(df["longitude_deg"], df["latitude_deg"], s=35, marker="o")
+
+    for _, row in df.iterrows():
+        ax.text(row["longitude_deg"] + 0.08, row["latitude_deg"] + 0.08, row["ident"], fontsize=9)
+
+    # Pad bounds
+    pad = 2.0
+    if len(df) >= 1:
+        ax.set_xlim(df["longitude_deg"].min() - pad, df["longitude_deg"].max() + pad)
+        ax.set_ylim(df["latitude_deg"].min() - pad, df["latitude_deg"].max() + pad)
+    else:
+        ax.set_xlim(42, 52)
+        ax.set_ylim(-27, -10)
+
+    ax.set_xlabel("Longitude (deg)")
+    ax.set_ylabel("Latitude (deg)")
+    ax.set_title("METAR stations (ICAO) — Cartopy not installed, scatter-only view")
+    ax.grid(True, linestyle="--", linewidth=0.4)
+
+    plt.tight_layout()
+    plt.savefig(OUT_PNG, dpi=200)
+    print(f"Wrote {OUT_PNG} (fallback plot; install cartopy for coastlines/borders)")
+
+
+if __name__ == "__main__":
+    df = load_airport_coords(ICAOS)
+
+    if df.empty:
+        print("ERROR: No station coordinates found. Check ICAO codes.")
+        sys.exit(1)
+
+    # Print a quick table so you can sanity-check
+    print(df[["ident", "latitude_deg", "longitude_deg", "name"]].to_string(index=False))
+
+    try:
+        plot_with_cartopy(df)
+    except ImportError:
+        plot_fallback(df)
+
+
+

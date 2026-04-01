@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+"""
+ONE figure with 6 subplots (one per station) comparing 10 m WRF wind speed
+from 4 runs against METAR-observed wind speed.
+
+Stations plotted (subplots):
+  FMMI, FMMT, FMEE, FMSD, FMNM, FMNA
+
+WRF inputs (wide CSVs; same directory as script):
+  fulldata.csv
+  noinsitu.csv
+  nosat.csv
+  noda.csv
+Each must contain:
+  time column + <ICAO>_wspd10_ms columns
+
+METAR input (Excel; same directory as script):
+  metar.xlsx
+
+METAR time is built from 4 columns:
+  year, month, day, hour
+
+X-axis ticks:
+  Every 6 hours at 00/06/12/18Z and x-limits are floored/ceiled to 6-hour boundaries.
+
+Output:
+  metar_vs_wrf_wind_6stations.png
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+import re
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+
+# -----------------------------
+# Config
+# -----------------------------
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+WRF_RUNS = {
+    "Full Data": "fulldata.csv",
+    "No In-situ": "noinsitu.csv",
+    "No Sat": "nosat.csv",
+    "No DA": "noda.csv",
+}
+
+METAR_XLSX = "metar.xlsx"
+
+STATIONS = ["FMMI", "FMMT", "FMEE", "FMSD", "FMNM", "FMNA"]
+
+OUTFIG = "metar_vs_wrf_wind_6stations.png"
+
+
+# -----------------------------
+# Time parsing
+# -----------------------------
+def parse_wrf_time(series: pd.Series) -> pd.Series:
+    s = series.astype(str).str.strip()
+
+    t = pd.to_datetime(s, format="%Y-%m-%d_%H:%M:%S", errors="coerce")
+
+    mask = t.isna()
+    if mask.any():
+        t2 = pd.to_datetime(s[mask], format="%Y-%m-%d %H:%M:%S", errors="coerce")
+        t.loc[mask] = t2
+
+    mask = t.isna()
+    if mask.any():
+        t3 = pd.to_datetime(s[mask].str.replace("_", " ", regex=False), errors="coerce")
+        t.loc[mask] = t3
+
+    if t.isna().any():
+        bad = s[t.isna()].iloc[:5].tolist()
+        raise ValueError("Failed to parse some timestamps in 'time'. Examples:\n  " + "\n  ".join(bad))
+
+    return t
+
+
+# -----------------------------
+# Load WRF CSVs
+# -----------------------------
+def load_wrf_csv(fname: str) -> pd.DataFrame:
+    path = SCRIPT_DIR / fname
+    if not path.exists():
+        raise FileNotFoundError(f"Missing WRF CSV: {path}")
+
+    df = pd.read_csv(path)
+    if "time" not in df.columns:
+        raise KeyError(f"{fname} missing 'time' column")
+
+    df["time"] = parse_wrf_time(df["time"])
+    df = df.sort_values("time").set_index("time")
+    return df
+
+
+# -----------------------------
+# Load METAR (year/month/day/hour)
+# -----------------------------
+def _norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(s).strip().lower())
+
+
+def detect_station_and_wind_cols(df: pd.DataFrame) -> tuple[str, str, str]:
+    cols = list(df.columns)
+    ncols = [_norm(c) for c in cols]
+
+    station_col = None
+    for c, nc in zip(cols, ncols):
+        if "station" in nc or "icao" in nc or nc == "stid":
+            station_col = c
+            break
+
+    wind_col = None
+    for c, nc in zip(cols, ncols):
+        if "sknt" in nc or "wspd" in nc or "wind" in nc:
+            wind_col = c
+            break
+
+    if station_col is None or wind_col is None:
+        raise RuntimeError(
+            "Could not detect station/wind columns in metar.xlsx.\n"
+            f"Columns present: {cols}"
+        )
+
+    # Units heuristic: sknt or kt => knots
+    units = "kt" if ("sknt" in _norm(wind_col) or "kt" in _norm(wind_col) or "knot" in _norm(wind_col)) else "m/s"
+    return station_col, wind_col, units
+
+
+def load_metar_xlsx() -> pd.DataFrame:
+    path = SCRIPT_DIR / METAR_XLSX
+    if not path.exists():
+        raise FileNotFoundError(f"Missing METAR Excel file: {path}")
+
+    df = pd.read_excel(path)
+
+    for c in ["year", "month", "day", "hour"]:
+        if c not in df.columns:
+            raise RuntimeError(
+                f"metar.xlsx is missing required time column {c!r}.\n"
+                f"Columns present: {list(df.columns)}"
+            )
+
+    station_col, wind_col, units = detect_station_and_wind_cols(df)
+
+    df = df.copy()
+    df["time"] = pd.to_datetime(
+        dict(year=df["year"], month=df["month"], day=df["day"], hour=df["hour"]),
+        errors="coerce",
+    )
+
+    if df["time"].isna().any():
+        raise RuntimeError("Failed to construct METAR datetime from year/month/day/hour.")
+
+    df["icao"] = df[station_col].astype(str).str.strip().str.upper()
+    ws = pd.to_numeric(df[wind_col], errors="coerce")
+
+    if units == "kt":
+        ws = ws * 0.514444  # kt -> m/s
+
+    df["wspd_ms"] = ws
+    df = df[["time", "icao", "wspd_ms"]].dropna().sort_values("time")
+    return df
+
+
+# -----------------------------
+# Plot
+# -----------------------------
+def main() -> None:
+    # Load WRF runs
+    wrf_data = {label: load_wrf_csv(fname) for label, fname in WRF_RUNS.items()}
+
+    # Validate required station columns exist
+    for stn in STATIONS:
+        col = f"{stn}_wspd10_ms"
+        for label, df in wrf_data.items():
+            if col not in df.columns:
+                raise KeyError(f"Missing column {col!r} in {WRF_RUNS[label]!r}")
+
+    # Load METAR
+    metar = load_metar_xlsx()
+
+    # ============================================================
+    # BIAS CALCULATION (Full Data vs METAR)
+    # ============================================================
+    print("\nComputing WRF wind speed bias (Full Data vs METAR)...")
+
+    fulldata = wrf_data["Full Data"]
+
+    bias_rows = []
+
+    for stn in STATIONS:
+        wrf_col = f"{stn}_wspd10_ms"
+
+        wrf_series = fulldata[[wrf_col]].rename(columns={wrf_col: "wrf"})
+        metar_series = (
+            metar[metar["icao"] == stn]
+            .set_index("time")[["wspd_ms"]]
+            .rename(columns={"wspd_ms": "obs"})
+        )
+
+        # Merge on time
+        merged = wrf_series.join(metar_series, how="inner").dropna()
+
+        # Remove calm / near-zero winds to avoid division blowups
+        merged = merged[merged["wrf"] > 0.5]
+
+        merged["ratio"] = merged["obs"] / merged["wrf"]
+
+        for _, row in merged.iterrows():
+            bias_rows.append({
+                "station": stn,
+                "ratio": row["ratio"]
+            })
+
+    bias_df = pd.DataFrame(bias_rows)
+
+    # Global bias factor
+    global_bias = bias_df["ratio"].mean()
+
+    # Per-station bias
+    station_bias = bias_df.groupby("station")["ratio"].mean()
+
+    print("\n====================================================")
+    print("WRF WIND SPEED BIAS FACTOR (Observed / WRF)")
+    print("====================================================")
+    print(f"\nGlobal bias factor: {global_bias:.3f}")
+
+    print("\nPer-station bias factors:")
+    for stn, val in station_bias.items():
+        print(f"  {stn}: {val:.3f}")
+
+    corrected_threshold = 20.0 * global_bias
+    print("\nSuggested corrected crosswind threshold:")
+    print(f"  20 kt * {global_bias:.3f} = {corrected_threshold:.2f} kt")
+    print("====================================================\n")
+
+    # 6 subplots: 3x2 grid
+    fig, axes = plt.subplots(nrows=3, ncols=2, figsize=(15, 10), sharex=True)
+    axes = axes.ravel()
+
+    for idx, stn in enumerate(STATIONS):
+        ax = axes[idx]
+        wrf_col = f"{stn}_wspd10_ms"
+
+        for label, df in wrf_data.items():
+            ax.plot(df.index, df[wrf_col].values, label=label)
+
+        m = metar[metar["icao"] == stn]
+        ax.scatter(m["time"].values, m["wspd_ms"].values, marker="o", s=18, label="METAR")
+
+        ax.set_title(stn)
+       
+        ax.grid(True)
+
+    # ---- 6-hour ticks anchored to 00/06/12/18Z + axis limits anchored to 6h ----
+    locator = mdates.HourLocator(byhour=[0, 6, 12, 18])
+    formatter = mdates.DateFormatter("%m-%d %HZ")
+
+    # global time bounds across WRF + METAR
+    all_times = []
+    for df in wrf_data.values():
+        if len(df.index) > 0:
+            all_times.append(df.index)
+    if len(metar) > 0:
+        all_times.append(metar["time"])
+
+    tmin = min(x.min() for x in all_times)
+    tmax = max(x.max() for x in all_times)
+
+    xmin = pd.Timestamp(tmin).floor("6h")
+    xmax = pd.Timestamp(tmax).ceil("6h")
+
+    for ax in axes[:len(STATIONS)]:
+        ax.xaxis.set_major_locator(locator)
+        ax.xaxis.set_major_formatter(formatter)
+        ax.set_xlim(xmin, xmax)
+
+    fig.autofmt_xdate()
+
+    # ---- Figure-level legend (restored) ----
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        ncol=5,
+        bbox_to_anchor=(0.5, 0.995),
+        frameon=True,
+    )
+
+    fig.supxlabel("Time (UTC)")
+    fig.supylabel("10 m Wind Speed (m/s)")
+    fig.tight_layout(rect=[0, 0, 1, 0.94])  # reserve top space for legend/title
+
+    outpath = SCRIPT_DIR / OUTFIG
+    fig.savefig(outpath, dpi=150, bbox_inches="tight")
+    print(f"Saved: {outpath}")
+
+
+if __name__ == "__main__":
+    main()
+
+
