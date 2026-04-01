@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""
+Σ over time for ALL stations (standardized axes across all subplots):
+For each ICAO station, compute Σ[trial - Full Data] profiles vs pressure for:
+  - Temperature (T, °C)  -> ΣΔT(p)   (solid)
+  - Dewpoint (Td, °C)    -> ΣΔTd(p)  (dashed)
+
+Then plot a single figure with 6 subplots (one per ICAO) with:
+  - shared Y axis (pressure) across all panels
+  - standardized X limits across all panels based on the global max |ΣΔ|
+
+Directory layout (script sits above these):
+  ./fulldata/
+  ./noda/
+  ./noinsitu/
+  ./nosat/
+
+Assumes one time per wrfout file.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+import numpy as np
+import matplotlib.pyplot as plt
+from netCDF4 import Dataset
+import wrf
+from metpy.units import units
+from matplotlib.ticker import ScalarFormatter, FixedLocator
+
+# -----------------
+# USER SETTINGS
+# -----------------
+BASE_DIR = Path(__file__).resolve().parent
+
+FULLDIR = "fulldata"
+RUNS = {
+    "No DA": "noda",
+    "No In-situ": "noinsitu",
+    "No Sat": "nosat",
+}
+
+STATIONS = {
+    "FMMI": (-18.7969, 47.4788),
+    "FMMT": (-18.1135, 49.3923),
+    "FMEE": (-20.8901, 55.5189),
+    "FMSD": (-25.0381, 46.9561),
+    "FMNM": (-15.6668, 46.3512),
+    "FMNA": (-12.3494, 49.2917),
+}
+
+WRFOUT_GLOB = "wrfout_d01_*"
+INTERP_IF_NEEDED = True
+
+# Plot styling
+RUN_COLORS = {
+    "No DA": "red",
+    "No In-situ": "orange",
+    "No Sat": "green",
+}
+LINESTYLE_T = "-"      # solid = ΣΔT
+LINESTYLE_TD = "--"    # dashed = ΣΔTd
+
+# Standardized axis behavior
+X_PAD_FRAC = 0.08          # add 8% padding on each side of symmetric xlim
+X_MIN_ABS_LIMIT = 1.0      # don't let xlim collapse too small
+FORCE_PRESSURE_RANGE = (1000, 100)  # shared y-limits
+
+OUTPNG = "sum_delta_profiles_allstations.png"
+
+
+# -----------------
+# HELPERS
+# -----------------
+def ll_to_xy(wrfin: Dataset, lat: float, lon: float) -> tuple[int, int]:
+    x, y = wrf.ll_to_xy(wrfin, lat, lon)
+    return int(x), int(y)
+
+
+def get_profile(wrfin: Dataset, x: int, y: int):
+    """
+    Return p (hPa), T (degC), Td (degC) for one column at timeidx=0.
+    """
+    p = wrf.getvar(wrfin, "pressure", timeidx=0)[:, y, x].values * units.hPa
+    T = wrf.getvar(wrfin, "tc", timeidx=0)[:, y, x].values * units.degC
+    Td = wrf.getvar(wrfin, "td", timeidx=0)[:, y, x].values * units.degC
+    return p, T, Td
+
+
+def interp_to(p_src, var_src, p_tgt):
+    ps = np.asarray(p_src.magnitude)
+    vs = np.asarray(var_src.magnitude)
+    pt = np.asarray(p_tgt.magnitude)
+
+    order = np.argsort(ps)
+    ps2 = ps[order]
+    vs2 = vs[order]
+
+    out = np.interp(pt, ps2, vs2, left=np.nan, right=np.nan)
+    return out * var_src.units
+
+
+def finite_max_abs(arr: np.ndarray) -> float:
+    a = np.asarray(arr, dtype=float)
+    a = a[np.isfinite(a)]
+    if a.size == 0:
+        return 0.0
+    return float(np.max(np.abs(a)))
+
+
+# -----------------
+# MAIN
+# -----------------
+def main():
+    full_dir = BASE_DIR / FULLDIR
+    if not full_dir.exists():
+        raise FileNotFoundError(f"Missing directory: {full_dir}")
+
+    full_files = sorted(full_dir.glob(WRFOUT_GLOB))
+    if not full_files:
+        raise FileNotFoundError(f"No files matched {WRFOUT_GLOB!r} in {full_dir}")
+
+    # Precompute x/y indices and a reference pressure grid for each station
+    station_xy: dict[str, tuple[int, int]] = {}
+    station_pref: dict[str, Any] = {}
+
+    with Dataset(str(full_files[0])) as ds0:
+        for icao, (lat, lon) in STATIONS.items():
+            x, y = ll_to_xy(ds0, lat, lon)
+            station_xy[icao] = (x, y)
+            p_ref, _T, _Td = get_profile(ds0, x, y)
+            station_pref[icao] = p_ref
+
+    # Initialize accumulators: per station, per run
+    acc_dT = {icao: {run: None for run in RUNS} for icao in STATIONS}
+    acc_dTd = {icao: {run: None for run in RUNS} for icao in STATIONS}
+    counts = {icao: {run: 0 for run in RUNS} for icao in STATIONS}
+
+    # Allocate arrays based on each station's vertical length
+    for icao in STATIONS:
+        nlev = station_pref[icao].size
+        for run in RUNS:
+            acc_dT[icao][run] = np.zeros(nlev, dtype=float) * units.delta_degC
+            acc_dTd[icao][run] = np.zeros(nlev, dtype=float) * units.delta_degC
+
+    # Loop over all times/files
+    for f_full in full_files:
+        basename = f_full.name
+
+        # Open fulldata file for this time once; use for all stations
+        with Dataset(str(f_full)) as ds_full:
+            full_profiles = {}
+            for icao, (x, y) in station_xy.items():
+                p_full, T_full, Td_full = get_profile(ds_full, x, y)
+
+                p_ref = station_pref[icao]
+                if INTERP_IF_NEEDED and (
+                    p_full.shape != p_ref.shape
+                    or not np.allclose(p_full.magnitude, p_ref.magnitude, atol=1e-3, rtol=0)
+                ):
+                    T_full = interp_to(p_full, T_full, p_ref)
+                    Td_full = interp_to(p_full, Td_full, p_ref)
+                    p_full = p_ref
+
+                full_profiles[icao] = (p_full, T_full, Td_full)
+
+        # For each trial run, open matching file if it exists
+        for run_name, subdir in RUNS.items():
+            f_trial = BASE_DIR / subdir / basename
+            if not f_trial.exists():
+                continue
+
+            with Dataset(str(f_trial)) as ds:
+                for icao, (x, y) in station_xy.items():
+                    p_ref = station_pref[icao]
+                    _p_full, T_full, Td_full = full_profiles[icao]
+
+                    p, T, Td = get_profile(ds, x, y)
+
+                    if INTERP_IF_NEEDED and (
+                        p.shape != p_ref.shape
+                        or not np.allclose(p.magnitude, p_ref.magnitude, atol=1e-3, rtol=0)
+                    ):
+                        T = interp_to(p, T, p_ref)
+                        Td = interp_to(p, Td, p_ref)
+                        p = p_ref
+
+                    dT = (T - T_full).to("delta_degC")
+                    dTd = (Td - Td_full).to("delta_degC")
+
+                    acc_dT[icao][run_name] += dT
+                    acc_dTd[icao][run_name] += dTd
+                    counts[icao][run_name] += 1
+
+    # Compute global max abs across ALL stations and runs (T and Td)
+    global_max = 0.0
+    for icao in STATIONS:
+        for run_name in RUNS:
+            if counts[icao][run_name] == 0:
+                continue
+            global_max = max(global_max, finite_max_abs(acc_dT[icao][run_name].magnitude))
+            global_max = max(global_max, finite_max_abs(acc_dTd[icao][run_name].magnitude))
+
+    # Build standardized symmetric x-limits
+    if global_max <= 0:
+        xlim = (-X_MIN_ABS_LIMIT, X_MIN_ABS_LIMIT)
+    else:
+        pad = global_max * X_PAD_FRAC
+        half = max(global_max + pad, X_MIN_ABS_LIMIT)
+        xlim = (-half, half)
+
+    # ---- Plot: 6 subplots (3x2), standardized axes ----
+    fig, axes = plt.subplots(nrows=3, ncols=2, figsize=(13, 14), sharey=True, sharex=True)
+    axes = axes.ravel()
+
+    for ax, icao in zip(axes, STATIONS.keys()):
+        p_ref = station_pref[icao]
+
+        for run_name in RUNS.keys():
+            n = counts[icao][run_name]
+            if n == 0:
+                continue
+
+            color = RUN_COLORS.get(run_name, "black")
+
+            ax.plot(
+                acc_dT[icao][run_name].magnitude,
+                p_ref.magnitude,
+                color=color,
+                linestyle=LINESTYLE_T,
+                linewidth=2.0,
+                label=f"ΣΔT {run_name}",
+            )
+            ax.plot(
+                acc_dTd[icao][run_name].magnitude,
+                p_ref.magnitude,
+                color=color,
+                linestyle=LINESTYLE_TD,
+                linewidth=2.0,
+                label=f"ΣΔTd {run_name}",
+            )
+
+        ax.axvline(0, linestyle=":", linewidth=1.2)
+        ax.set_yscale("log")
+        ax.set_ylim(FORCE_PRESSURE_RANGE[0], FORCE_PRESSURE_RANGE[1])
+
+# Force clean pressure ticks (no scientific notation)
+        pressure_ticks = [1000, 850, 700, 600, 500, 400, 300, 200, 100]
+        ax.yaxis.set_major_locator(FixedLocator(pressure_ticks))
+
+        sf = ScalarFormatter()
+        sf.set_scientific(False)
+        sf.set_useOffset(False)
+        ax.yaxis.set_major_formatter(sf)
+        ax.set_xlim(xlim[0], xlim[1])
+        ax.grid(True, which="both", linestyle="--", linewidth=0.5, alpha=0.6)
+        ax.set_title(icao)
+
+    # Shared labels
+    fig.supxlabel("Σ[Trial − Full] (°C)")
+    fig.supylabel("Pressure (hPa)")
+
+    # One shared legend (pull from first axis that has labels)
+    handles, labels = None, None
+    for ax in axes:
+        h, l = ax.get_legend_handles_labels()
+        if h:
+            handles, labels = h, l
+            break
+    if handles:
+        fig.legend(handles, labels, loc="upper center", ncol=3, frameon=True, bbox_to_anchor=(0.5, 0.98))
+
+    fig.suptitle("Sum Differences of Temperature and Dewpoint", y=0.995, fontsize=16)
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+
+    outpath = BASE_DIR / OUTPNG
+    fig.savefig(outpath, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"Saved: {outpath}")
+    print(f"Standardized x-limits: {xlim[0]:.2f} to {xlim[1]:.2f} °C (sum units)")
+
+    # Print quick counts
+    for icao in STATIONS:
+        msg = ", ".join([f"{run}={counts[icao][run]}" for run in RUNS])
+        print(f"{icao}: {msg} (out of {len(full_files)} fulldata times)")
+
+
+if __name__ == "__main__":
+    main()
