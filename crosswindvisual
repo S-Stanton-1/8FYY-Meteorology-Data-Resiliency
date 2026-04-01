@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap, BoundaryNorm
+import matplotlib.dates as mdates
+
+
+# ============================================================
+# USER SETTINGS
+# ============================================================
+INPUT_CSV = "icao_crosswind_assessment_10kt.csv"
+
+OUTPUT_HEATMAP = "crosswind_go_nogo_heatmap_10kt.png"
+OUTPUT_BAR = "crosswind_nogo_counts_10kt.png"
+
+FIG_DPI = 300
+
+TRIAL_ORDER = ["Full Data", "No In-situ", "No Sat", "No DA"]
+ICAO_ORDER = ["FMNA", "FMNM", "FMMT", "FMMI", "FMSD", "FMEE"]
+
+# 0 = GO, 1 = NO-GO
+FLAG_MAP = {
+    "GO": 0,
+    "NO-GO": 1
+}
+
+
+# ============================================================
+# LOAD AND PREPARE
+# ============================================================
+def load_crosswind_csv(path):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Could not find input CSV: {path}")
+
+    df = pd.read_csv(path)
+
+    required_cols = {"trial", "icao", "time", "crosswind_flag"}
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise ValueError(f"CSV is missing required columns: {sorted(missing)}")
+
+    df["time"] = pd.to_datetime(df["time"], errors="coerce")
+    df = df.dropna(subset=["time"]).copy()
+
+    df["flag_value"] = df["crosswind_flag"].map(FLAG_MAP)
+    if df["flag_value"].isna().any():
+        bad = df.loc[df["flag_value"].isna(), "crosswind_flag"].unique()
+        raise ValueError(f"Unexpected crosswind_flag values found: {bad}")
+
+    df["flag_value"] = df["flag_value"].astype(int)
+
+    return df
+
+
+# ============================================================
+# HEATMAP PLOT
+# ============================================================
+def make_heatmap(df, output_path):
+    # Determine common time axis across all panels
+    all_times = sorted(df["time"].unique())
+
+    if len(all_times) == 0:
+        raise RuntimeError("No valid time values found in CSV.")
+
+    fig, axes = plt.subplots(
+        nrows=len(TRIAL_ORDER),
+        ncols=1,
+        figsize=(16, 10),
+        sharex=True,
+        constrained_layout=True
+    )
+
+    if len(TRIAL_ORDER) == 1:
+        axes = [axes]
+
+    cmap = ListedColormap(["white", "red"])
+    norm = BoundaryNorm([-0.5, 0.5, 1.5], cmap.N)
+
+    for ax, trial in zip(axes, TRIAL_ORDER):
+        sub = df[df["trial"] == trial].copy()
+
+        # Build matrix: ICAO x time
+        pivot = (
+            sub.pivot_table(
+                index="icao",
+                columns="time",
+                values="flag_value",
+                aggfunc="max"
+            )
+            .reindex(index=ICAO_ORDER, columns=all_times)
+        )
+
+        # Missing values remain NaN; display them as GO-like background unless you prefer gray
+        data = pivot.values.astype(float)
+
+        # Plot with imshow for simple categorical blocks
+        im = ax.imshow(
+            data,
+            aspect="auto",
+            interpolation="none",
+            cmap=cmap,
+            norm=norm
+        )
+
+        ax.set_yticks(np.arange(len(ICAO_ORDER)))
+        ax.set_yticklabels(ICAO_ORDER, fontsize=10)
+        ax.set_title(trial, fontsize=12)
+        ax.set_ylabel("ICAO", fontsize=10)
+
+        # Thin gridlines between cells
+        ax.set_xticks(np.arange(-0.5, len(all_times), 1), minor=True)
+        ax.set_yticks(np.arange(-0.5, len(ICAO_ORDER), 1), minor=True)
+        ax.grid(which="minor", color="black", linestyle="-", linewidth=0.15)
+        ax.tick_params(which="minor", bottom=False, left=False)
+
+    # Time labels only on bottom panel
+    bottom_ax = axes[-1]
+
+    # Choose a readable subset of tick labels
+    nt = len(all_times)
+    max_labels = 12
+    step = max(1, nt // max_labels)
+    tick_idx = np.arange(0, nt, step)
+
+    tick_labels = [
+        pd.Timestamp(all_times[i]).strftime("%m-%d %HZ")
+        for i in tick_idx
+    ]
+
+    bottom_ax.set_xticks(tick_idx)
+    bottom_ax.set_xticklabels(tick_labels, rotation=45, ha="right", fontsize=9)
+    bottom_ax.set_xlabel("Time (UTC)", fontsize=11)
+
+    # Title
+    fig.suptitle(
+        "Crosswind GO / NO-GO Heatmap",
+        fontsize=14
+    )
+
+    # Manual legend
+    from matplotlib.patches import Patch
+    legend_handles = [
+        Patch(facecolor="white", edgecolor="black", label="GO"),
+        Patch(facecolor="red", edgecolor="black", label="NO-GO"),
+    ]
+    fig.legend(
+        handles=legend_handles,
+        loc="upper right",
+        bbox_to_anchor=(0.98, 0.98),
+        frameon=True
+    )
+
+    fig.savefig(output_path, dpi=FIG_DPI, bbox_inches="tight")
+    print(f"[INFO] Saved heatmap: {output_path}")
+
+
+# ============================================================
+# SUMMARY BAR CHART
+# ============================================================
+def make_nogo_bar_chart(df, output_path):
+    counts = (
+        df.assign(is_nogo=(df["crosswind_flag"] == "NO-GO").astype(int))
+          .groupby(["trial", "icao"])["is_nogo"]
+          .sum()
+          .reset_index()
+    )
+
+    # Keep consistent order
+    counts["trial"] = pd.Categorical(counts["trial"], categories=TRIAL_ORDER, ordered=True)
+    counts["icao"] = pd.Categorical(counts["icao"], categories=ICAO_ORDER, ordered=True)
+    counts = counts.sort_values(["icao", "trial"])
+
+    pivot = counts.pivot(index="icao", columns="trial", values="is_nogo").reindex(index=ICAO_ORDER)
+    pivot = pivot.reindex(columns=TRIAL_ORDER)
+
+    fig, ax = plt.subplots(figsize=(12, 7), constrained_layout=True)
+
+    x = np.arange(len(ICAO_ORDER))
+    width = 0.2
+
+    for k, trial in enumerate(TRIAL_ORDER):
+        ax.bar(
+            x + (k - 1.5) * width,
+            pivot[trial].values,
+            width=width,
+            label=trial
+        )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(ICAO_ORDER, fontsize=10)
+    ax.set_ylabel("Number of NO-GO Timesteps", fontsize=11)
+    ax.set_xlabel("ICAO", fontsize=11)
+    ax.set_title("NO-GO Counts by ICAO and Trial", fontsize=14)
+    ax.legend(frameon=True)
+    ax.grid(True, axis="y", linestyle="--", alpha=0.5)
+
+    fig.savefig(output_path, dpi=FIG_DPI, bbox_inches="tight")
+    print(f"[INFO] Saved bar chart: {output_path}")
+
+
+# ============================================================
+# MAIN
+# ============================================================
+def main():
+    df = load_crosswind_csv(INPUT_CSV)
+
+    # Restrict to requested ordering if present
+    df = df[df["trial"].isin(TRIAL_ORDER) & df["icao"].isin(ICAO_ORDER)].copy()
+
+    if df.empty:
+        raise RuntimeError("No data left after filtering to expected trials and ICAOs.")
+
+    make_heatmap(df, OUTPUT_HEATMAP)
+    make_nogo_bar_chart(df, OUTPUT_BAR)
+
+    # Optional printed summaries
+    summary = (
+        df.assign(is_nogo=(df["crosswind_flag"] == "NO-GO").astype(int))
+          .groupby(["trial", "icao"])["is_nogo"]
+          .sum()
+          .reset_index(name="n_no_go")
+    )
+
+    print("\n[INFO] NO-GO counts by trial and ICAO:")
+    print(summary.to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()

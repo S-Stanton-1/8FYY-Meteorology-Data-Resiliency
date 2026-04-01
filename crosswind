@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+
+import os
+import glob
+import numpy as np
+import pandas as pd
+from netCDF4 import Dataset, chartostring
+
+
+# ============================================================
+# USER SETTINGS
+# ============================================================
+TRIAL_DIRS = {
+    "Full Data": "./fulldata",
+    "No Insitu": "./noinsitu",
+    "No Sat": "./nosat",
+    "No DA": "./noda",
+}
+
+OUTPUT_CSV = "icao_crosswind_assessment_15kt.csv"
+
+# Crosswind threshold in knots
+CROSSWIND_THRESHOLD_KT = 10.0
+
+# ICAO station coordinates and runway axis heading
+# Use one heading only; reciprocal runway is the same axis
+ICAOS = {
+    "FMNA": {"lat": -12.349400, "lon": 49.291700, "runway_heading_deg": 130.0},  # 13/31
+    "FMNM": {"lat": -15.666842, "lon": 46.351233, "runway_heading_deg": 140.0},  # 14/32
+    "FMMT": {"lat": -18.109500, "lon": 49.392502, "runway_heading_deg": 10.0},   # 01/19
+    "FMMI": {"lat": -18.796900, "lon": 47.478802, "runway_heading_deg": 110.0},  # 11/29
+    "FMSD": {"lat": -25.038100, "lon": 46.956100, "runway_heading_deg": 80.0},   # 08/26
+    "FMEE": {"lat": -20.890087, "lon": 55.518894, "runway_heading_deg": 120.0},  # 12/30
+}
+
+# Search pattern
+WRFOUT_GLOB = "**/wrfout_d01_*"
+
+
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+def angular_difference_deg(a, b):
+    """
+    Smallest absolute angular difference between two directions (degrees).
+    Returns value in [0, 180].
+    """
+    return abs((a - b + 180.0) % 360.0 - 180.0)
+
+
+def angle_to_runway_axis_deg(wind_dir_deg_from, runway_heading_deg):
+    """
+    Return smallest angle between the wind direction and the runway axis.
+    Because a runway axis is bidirectional (e.g. 130/310), compare to both
+    headings and return the smaller value. Result in [0, 90].
+    """
+    h1 = runway_heading_deg % 360.0
+    h2 = (runway_heading_deg + 180.0) % 360.0
+
+    d1 = angular_difference_deg(wind_dir_deg_from, h1)
+    d2 = angular_difference_deg(wind_dir_deg_from, h2)
+
+    axis_diff = min(d1, d2)
+    return min(axis_diff, 180.0 - axis_diff)
+
+
+def wind_speed_dir_from_uv(u, v):
+    """
+    Compute wind speed and meteorological wind direction FROM which the wind blows.
+
+    Inputs:
+      u = eastward wind component
+      v = northward wind component
+
+    Returns:
+      speed_mps, direction_deg_from
+    """
+    speed = np.sqrt(u * u + v * v)
+
+    # Meteorological wind direction FROM which wind blows
+    # Checks:
+    #   u=0,  v=-10 -> from north = 0 deg
+    #   u=-10, v=0  -> from east  = 90 deg
+    #   u=0,  v=10  -> from south = 180 deg
+    #   u=10, v=0   -> from west  = 270 deg
+    wind_dir = (270.0 - np.degrees(np.arctan2(v, u))) % 360.0
+
+    return speed, wind_dir
+
+
+def crosswind_component_kt(speed_mps, wind_dir_deg_from, runway_heading_deg):
+    """
+    Compute crosswind component in knots relative to runway axis.
+    """
+    diff_deg = angle_to_runway_axis_deg(wind_dir_deg_from, runway_heading_deg)
+    xwind_mps = speed_mps * abs(np.sin(np.deg2rad(diff_deg)))
+    xwind_kt = xwind_mps * 1.94384449
+    return xwind_kt, diff_deg
+
+
+def get_time_strings(nc):
+    """
+    Robustly decode WRF Times variable into list of strings.
+    """
+    times = nc.variables["Times"][:]
+
+    try:
+        decoded = chartostring(times)
+        return [str(t) for t in decoded]
+    except Exception:
+        out = []
+        for row in times:
+            if hasattr(row, "tobytes"):
+                s = row.tobytes().decode("utf-8", errors="ignore").strip("\x00")
+            else:
+                s = "".join(x.decode("utf-8") if isinstance(x, bytes) else str(x) for x in row)
+            out.append(s)
+        return out
+
+
+def get_latlon_2d(nc):
+    """
+    Get 2D XLAT/XLONG fields.
+    """
+    xlat = nc.variables["XLAT"][:]
+    xlon = nc.variables["XLONG"][:]
+
+    if xlat.ndim == 3:
+        xlat = xlat[0, :, :]
+    if xlon.ndim == 3:
+        xlon = xlon[0, :, :]
+
+    return np.array(xlat), np.array(xlon)
+
+
+def nearest_gridpoint(lat2d, lon2d, target_lat, target_lon):
+    """
+    Find nearest grid point index to a station lat/lon.
+    """
+    dist2 = (lat2d - target_lat) ** 2 + (lon2d - target_lon) ** 2
+    j, i = np.unravel_index(np.argmin(dist2), dist2.shape)
+    return int(j), int(i)
+
+
+def discover_wrfouts(base_dir):
+    """
+    Recursively find wrfout files under a trial directory.
+    """
+    pattern = os.path.join(base_dir, WRFOUT_GLOB)
+    files = sorted(glob.glob(pattern, recursive=True))
+    return [f for f in files if os.path.isfile(f)]
+
+
+# ============================================================
+# MAIN PROCESSING
+# ============================================================
+def main():
+    rows = []
+
+    for trial_name, trial_dir in TRIAL_DIRS.items():
+        wrf_files = discover_wrfouts(trial_dir)
+
+        if not wrf_files:
+            print(f"[WARN] No wrfout files found for trial '{trial_name}' in {trial_dir}")
+            continue
+
+        print(f"[INFO] {trial_name}: found {len(wrf_files)} wrfout files")
+
+        # Build nearest-grid lookup once using first file
+        first_nc = Dataset(wrf_files[0])
+        lat2d, lon2d = get_latlon_2d(first_nc)
+
+        station_ij = {}
+        for icao, meta in ICAOS.items():
+            j, i = nearest_gridpoint(lat2d, lon2d, meta["lat"], meta["lon"])
+            station_ij[icao] = (j, i)
+            print(
+                f"[INFO] {trial_name} {icao}: nearest grid j={j}, i={i}, "
+                f"grid_lat={lat2d[j, i]:.4f}, grid_lon={lon2d[j, i]:.4f}"
+            )
+        first_nc.close()
+
+        # Process every wrfout
+        for path in wrf_files:
+            print(f"[INFO] Reading {path}")
+            nc = Dataset(path)
+
+            times = get_time_strings(nc)
+
+            if "U10" not in nc.variables or "V10" not in nc.variables:
+                nc.close()
+                raise KeyError(
+                    f"U10 and/or V10 not found in {path}. "
+                    "This script expects standard WRF 10-m winds."
+                )
+
+            u10 = nc.variables["U10"][:]
+            v10 = nc.variables["V10"][:]
+
+            if u10.ndim != 3 or v10.ndim != 3:
+                nc.close()
+                raise ValueError(
+                    f"Unexpected U10/V10 dimensions in {path}: {u10.shape}, {v10.shape}"
+                )
+
+            nt = u10.shape[0]
+
+            for t in range(nt):
+                timestamp = times[t].replace("_", " ")
+
+                for icao, meta in ICAOS.items():
+                    j, i = station_ij[icao]
+
+                    u = float(u10[t, j, i])
+                    v = float(v10[t, j, i])
+
+                    speed_mps, wind_dir_deg = wind_speed_dir_from_uv(u, v)
+                    speed_kt = speed_mps * 1.94384449
+
+                    runway_heading_deg = meta["runway_heading_deg"]
+                    xwind_kt, angle_from_axis_deg = crosswind_component_kt(
+                        speed_mps, wind_dir_deg, runway_heading_deg
+                    )
+
+                    flag = "NO-GO" if xwind_kt >= CROSSWIND_THRESHOLD_KT else "GO"
+
+                    rows.append({
+                        "trial": trial_name,
+                        "icao": icao,
+                        "time": timestamp,
+                        "station_lat": meta["lat"],
+                        "station_lon": meta["lon"],
+                        "grid_j": j,
+                        "grid_i": i,
+                        "grid_lat": float(lat2d[j, i]),
+                        "grid_lon": float(lon2d[j, i]),
+                        "runway_heading_deg": runway_heading_deg,
+                        "wind_u10_mps": u,
+                        "wind_v10_mps": v,
+                        "wind_speed_10m_mps": speed_mps,
+                        "wind_speed_10m_kt": speed_kt,
+                        "wind_dir_from_deg": wind_dir_deg,
+                        "angle_to_runway_axis_deg": angle_from_axis_deg,
+                        "crosswind_component_kt": xwind_kt,
+                        "crosswind_threshold_kt": CROSSWIND_THRESHOLD_KT,
+                        "crosswind_flag": flag,
+                    })
+
+            nc.close()
+
+    if not rows:
+        raise RuntimeError("No output rows were generated. Check trial paths and wrfout files.")
+
+    df = pd.DataFrame(rows)
+
+    # Sort cleanly
+    df["time"] = pd.to_datetime(df["time"], errors="coerce")
+    df = df.sort_values(["trial", "icao", "time"]).reset_index(drop=True)
+
+    # Save
+    df.to_csv(OUTPUT_CSV, index=False)
+    print(f"[INFO] Saved CSV: {OUTPUT_CSV}")
+
+    # Summary diagnostics
+    summary = (
+        df.groupby(["trial", "icao", "crosswind_flag"])
+          .size()
+          .unstack(fill_value=0)
+          .reset_index()
+    )
+
+    if "GO" not in summary.columns:
+        summary["GO"] = 0
+    if "NO-GO" not in summary.columns:
+        summary["NO-GO"] = 0
+
+    summary = summary[["trial", "icao", "GO", "NO-GO"]]
+
+    print("\n[INFO] GO / NO-GO timestep counts by trial and ICAO:")
+    print(summary.to_string(index=False))
+
+    # Additional diagnostic: max crosswind per trial and ICAO
+    max_xwind = (
+        df.groupby(["trial", "icao"])["crosswind_component_kt"]
+          .max()
+          .reset_index(name="max_crosswind_kt")
+    )
+
+    print("\n[INFO] Maximum crosswind component (kt) by trial and ICAO:")
+    print(max_xwind.to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()
