@@ -1,0 +1,159 @@
+#!/usr/bin/python3
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+import numpy as np
+import re
+from datetime import datetime
+
+FILE = "bsh112023.dat"
+
+# -------------------------------------------------------------
+# Decode JTWC coordinate (e.g., 1173E -> 117.3)
+# -------------------------------------------------------------
+def decode_coord(coord):
+    m = re.match(r"(\d+)([NSEW])", coord)
+    if not m:
+        return None
+    val = float(m.group(1)) / 10.0
+    if m.group(2) in ["S", "W"]:
+        val = -val
+    return val
+
+# -------------------------------------------------------------
+# Load JTWC Freddy Best Track
+# -------------------------------------------------------------
+rows = []
+with open(FILE) as f:
+    for line in f:
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 8:
+            continue
+
+        # time
+        try:
+            t = datetime.strptime(parts[2], "%Y%m%d%H")
+        except:
+            continue
+
+        lat = decode_coord(parts[6])
+        lon = decode_coord(parts[7])
+
+        if lat is None or lon is None:
+            continue
+
+        rows.append((t, lat, lon))
+
+df = pd.DataFrame(rows, columns=["time", "lat", "lon"]).sort_values("time")
+
+# -------------------------------------------------------------
+# Deduplicate daily 00Z records & choose every-other-day markers
+# -------------------------------------------------------------
+df_midnight = df[df["time"].dt.hour == 0].copy()
+df_midnight["date_only"] = df_midnight["time"].dt.date
+df_midnight = df_midnight.groupby("date_only").first().reset_index()
+
+markers = df_midnight[df_midnight["date_only"].apply(lambda d: d.day % 2 == 0)]
+markers = markers.reset_index(drop=True)
+
+# -------------------------------------------------------------
+# Adaptive label offset to avoid overlap
+# -------------------------------------------------------------
+def adaptive_offset(x, y, prev_positions, scale=1.0):
+    """
+    Attempts several perpendicular offsets to avoid overlaps.
+    """
+    for dist in np.linspace(0.8, 2.5, 12):    # degrees of offset
+        for angle in [90, -90]:               # left & right of track
+            rad = np.radians(angle)
+            dx = dist * np.cos(rad) * scale
+            dy = dist * np.sin(rad) * scale
+            x_try = x + dx
+            y_try = y + dy
+
+            if all(np.hypot(x_try - px, y_try - py) > 1.2 for px, py in prev_positions):
+                return x_try, y_try
+
+    # fallback if no place found
+    return x + 1.0, y + 1.0
+
+# -------------------------------------------------------------
+# Plotting function (for each domain)
+# -------------------------------------------------------------
+def make_plot(df_in, markers_in, filename, extent):
+    fig = plt.figure(figsize=(12,7))
+    ax = plt.axes(projection=ccrs.PlateCarree())
+    ax.set_extent(extent, crs=ccrs.PlateCarree())
+
+    ax.add_feature(cfeature.LAND, facecolor="lightgray")
+    ax.add_feature(cfeature.COASTLINE, linewidth=1.)
+    ax.add_feature(cfeature.BORDERS, linewidth=0.7)
+
+    # Track line
+    ax.plot(df_in["lon"], df_in["lat"], "-o",
+            markersize=3, linewidth=1.2, color="blue", zorder=3)
+
+    # Marker dots
+    ax.scatter(markers_in["lon"], markers_in["lat"],
+               s=40, color="red", zorder=4)
+
+    # Labels with adaptive offset
+    label_positions = []
+    for i in range(len(markers_in)):
+        x = markers_in.iloc[i]["lon"]
+        y = markers_in.iloc[i]["lat"]
+        scale = np.cos(np.radians(y))
+
+        x_lab, y_lab = adaptive_offset(x, y, label_positions, scale)
+        label_positions.append((x_lab, y_lab))
+
+        label = markers_in.iloc[i]["time"].strftime("%d %b")
+
+        ax.text(
+            x_lab, y_lab, label,
+            fontsize=9, color="red",
+            ha="center", va="center",
+            rotation=0,    # horizontal labels
+            transform=ccrs.PlateCarree(),
+            zorder=5
+        )
+
+    plt.title(filename.replace(".png", ""))
+    plt.tight_layout()
+    plt.savefig(filename, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print("Saved:", filename)
+
+# -------------------------------------------------------------
+# DOMAIN 1 — Genesis → 24 Feb
+# -------------------------------------------------------------
+cutoff = datetime(2023, 2, 24, 0)
+
+df_dom1 = df[df["time"] <= cutoff]
+mk_dom1 = markers[markers["time"] <= cutoff]
+
+make_plot(
+    df_dom1, 
+    mk_dom1,
+    "a) Track (Indian Ocean)",
+    extent=[20, 140, -35, 5]
+)
+
+# -------------------------------------------------------------
+# DOMAIN 2 — 24 Feb → End (Mozambique Channel)
+# -------------------------------------------------------------
+df_dom2 = df[df["time"] >= cutoff]
+mk_dom2 = markers[markers["time"] >= cutoff]
+
+make_plot(
+    df_dom2,
+    mk_dom2,
+    "b) Track (Mozambique Channel)",
+    extent=[25, 55, -30, 0]
+)
+
+
+
+
