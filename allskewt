@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""
+Batch Skew-T generator:
+  - For each wrfout file (time) in ./fulldata
+  - For each station in STATIONS
+  - Produce a 2x2 Skew-T comparison figure (fulldata, noda, noinsitu, nosat)
+  - Save under ./skew-t plots/<ICAO>/
+
+Directory layout (script is one level ABOVE run directories):
+  ./fulldata/wrfout_d01_*
+  ./noda/wrfout_d01_*
+  ./noinsitu/wrfout_d01_*
+  ./nosat/wrfout_d01_*
+
+Outputs:
+  ./skew-t plots/<ICAO>/SkewT_<ICAO>_<YYYY-MM-DD_HHMMZ>.png
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+import numpy as np
+import matplotlib.pyplot as plt
+
+from netCDF4 import Dataset
+import wrf
+
+import metpy.calc as mpcalc
+from metpy.plots import SkewT
+from metpy.units import units
+
+
+# ----------------------------
+# User config
+# ----------------------------
+RUNS = {
+    "Full Data": "fulldata",
+    "No DA": "noda",
+    "No Insitu": "noinsitu",
+    "No Sat": "nosat",
+}
+
+# Six stations you requested
+STATIONS = {
+    "FMMI": (-18.7969, 47.4788),
+    "FMMT": (-18.1135, 49.3923),
+    "FMEE": (-20.8901, 55.5189),
+    "FMSD": (-25.0381, 46.9561),
+    "FMNM": (-15.6668, 46.3512),
+    "FMNA": (-12.3494, 49.2917),
+}
+
+# Which wrfout pattern to process (adjust d01/d02 as needed)
+WRFOUT_GLOB = "wrfout_d01_*"
+
+OUT_ROOT = "skew-t plots"  # main output directory
+
+# Plot styling / bounds
+SKEW_ROTATION = 45
+YMIN_HPA, YMAX_HPA = 1000, 100
+XMIN_C, XMAX_C = -60, 40
+
+# Wind barb spacing (pressure levels to sample)
+BARB_STEP_HPA = 50
+
+# If a matching file is missing in a run, either skip that panel (True) or error out (False)
+SKIP_MISSING_RUN_FILES = True
+
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def safe_timestr(wrfin: Dataset) -> str:
+    """
+    Return 'YYYY-MM-DD_HHMMZ' for filename suffix from WRF Times.
+    """
+    try:
+        t = wrf.getvar(wrfin, "times", timeidx=0)  # wrf-python time string/array
+        # Usually returns a numpy string like '2023-02-20_00:00:00'
+        s = str(np.asarray(t).item())
+    except Exception:
+        # fallback: try raw variable
+        try:
+            raw = wrfin.variables["Times"][0]
+            s = raw.tobytes().decode("utf-8", errors="ignore").strip()
+        except Exception:
+            return "unknown_time"
+
+    # Normalize
+    s = s.replace(" ", "_")
+    # Expect 'YYYY-MM-DD_HH:MM:SS' or 'YYYY-MM-DD_HH:MM:SS.0000'
+    s = s.split(".")[0]
+    # Convert to YYYY-MM-DD_HHMMZ
+    try:
+        date_part, time_part = s.split("_")
+        hh, mm, _ss = time_part.split(":")
+        return f"{date_part}_{hh}{mm}Z"
+    except Exception:
+        # last resort: scrub characters
+        return "".join(ch for ch in s if ch.isalnum() or ch in ("-", "_"))
+
+
+def open_if_exists(path: Path) -> Dataset | None:
+    if not path.exists():
+        return None
+    return Dataset(str(path))
+
+
+def ll_to_xy_cached(wrfin: Dataset, lat: float, lon: float) -> tuple[int, int]:
+    x, y = wrf.ll_to_xy(wrfin, lat, lon)
+    return int(x), int(y)
+
+
+def extract_profile(wrfin: Dataset, x: int, y: int):
+    """
+    Extract needed vertical profiles at one point for Skew-T:
+      p (hPa), T (degC), Td (degC), u/v (m/s)
+    """
+    p3d = wrf.getvar(wrfin, "pressure", timeidx=0)  # hPa
+    T3d = wrf.getvar(wrfin, "tc", timeidx=0)        # degC
+    Td3d = wrf.getvar(wrfin, "td", timeidx=0)       # degC
+    u3d = wrf.getvar(wrfin, "ua", timeidx=0)        # m/s
+    v3d = wrf.getvar(wrfin, "va", timeidx=0)        # m/s
+
+    p = p3d[:, y, x].values * units.hPa
+    T = T3d[:, y, x].values * units.degC
+    Td = Td3d[:, y, x].values * units.degC
+    u = u3d[:, y, x].values * units("m/s")
+    v = v3d[:, y, x].values * units("m/s")
+
+    return p, T, Td, u, v
+
+
+def plot_one_panel(fig, subplot_loc: int, run_name: str, wrfin: Dataset, lat: float, lon: float):
+    """
+    Plot a single SkewT panel into the given subplot slot.
+    """
+    x, y = ll_to_xy_cached(wrfin, lat, lon)
+    p, T, Td, u, v = extract_profile(wrfin, x, y)
+
+    skew = SkewT(fig, subplot=subplot_loc, rotation=SKEW_ROTATION)
+    skew.plot(p, T, "r", linewidth=1.6)
+    skew.plot(p, Td, "g", linewidth=1.6)
+
+    # Barb spacing every BARB_STEP_HPA; use descending pressure to match typical p order (1000 -> 100)
+    my_interval = np.arange(YMIN_HPA, YMAX_HPA - 1, -BARB_STEP_HPA) * units.hPa
+    # resample_nn_1d expects 1D arrays with units; works fine here
+    ix = mpcalc.resample_nn_1d(p, my_interval)
+    skew.plot_barbs(p[ix], u[ix], v[ix])
+
+    skew.plot_dry_adiabats(alpha=0.5)
+    skew.plot_moist_adiabats(alpha=0.5)
+    skew.plot_mixing_lines(alpha=0.5)
+
+    skew.ax.set_ylim(YMIN_HPA, YMAX_HPA)
+    skew.ax.set_xlim(XMIN_C, XMAX_C)
+    skew.ax.set_title(run_name, fontsize=12)
+
+    return skew
+
+
+# ----------------------------
+# Main
+# ----------------------------
+def main() -> None:
+    base_dir = Path(__file__).resolve().parent
+
+    run_paths = {name: (base_dir / subdir) for name, subdir in RUNS.items()}
+    for name, p in run_paths.items():
+        if not p.exists():
+            raise FileNotFoundError(f"Missing run directory: {p} (for run '{name}')")
+
+    # Discover times/files from fulldata directory
+    base_files = sorted(run_paths["Full Data"].glob(WRFOUT_GLOB))
+    if not base_files:
+        raise FileNotFoundError(f"No files matched {WRFOUT_GLOB!r} under {run_paths['Full Data']}")
+
+    out_root = base_dir / OUT_ROOT
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    print(f"Found {len(base_files)} wrfout files in {run_paths['Full Data']}")
+    print(f"Writing output under: {out_root}")
+
+    subplot_locs = [221, 222, 223, 224]  # 2x2 layout
+    run_items = list(RUNS.items())       # preserve order
+
+    for f_full in base_files:
+        basename = f_full.name
+
+        # Open fulldata file first to get timestamp string (and also sanity-check)
+        with Dataset(str(f_full)) as ds_time:
+            ts = safe_timestr(ds_time)
+
+        # For each station: create a figure and fill panels from each run
+        for icao, (lat, lon) in STATIONS.items():
+            station_dir = out_root / icao
+            station_dir.mkdir(parents=True, exist_ok=True)
+
+            fig = plt.figure(figsize=(14, 12))
+
+            # For each run panel, open matching wrfout file
+            for (run_name, subdir), subplot_loc in zip(run_items, subplot_locs):
+                fpath = run_paths[run_name] / basename
+                ds = open_if_exists(fpath)
+
+                if ds is None:
+                    msg = f"Missing {run_name} file: {fpath}"
+                    if SKIP_MISSING_RUN_FILES:
+                        # draw an empty panel with message
+                        ax = fig.add_subplot(subplot_loc)
+                        ax.axis("off")
+                        ax.text(0.5, 0.5, msg, ha="center", va="center", wrap=True)
+                        continue
+                    raise FileNotFoundError(msg)
+
+                try:
+                    plot_one_panel(fig, subplot_loc, run_name, ds, lat, lon)
+                finally:
+                    ds.close()
+
+            fig.suptitle(
+                f"Skew-T Comparison, {icao}, {basename}",
+                fontsize=16,
+                weight="bold",
+            )
+
+            # tight_layout is OK for plain matplotlib axes; SkewT uses standard axes
+            plt.tight_layout(rect=[0, 0, 1, 0.96])
+
+            out_png = station_dir / f"SkewT_{icao}_{ts}.png"
+            fig.savefig(out_png, dpi=250, bbox_inches="tight")
+            plt.close(fig)
+
+        print(f"Done time: {basename}  ({ts})")
+
+    print("✅ Completed all timestamps and stations.")
+
+
+if __name__ == "__main__":
+    main()
