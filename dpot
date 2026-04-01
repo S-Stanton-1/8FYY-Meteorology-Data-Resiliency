@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""
+3x3 Potential Temperature (theta) difference summary:
+
+Compute:
+  SUM_t [ THETA@LEVEL(trial) - THETA@LEVEL(fulldata) ]
+
+Rows:    300, 500, 850 hPa
+Columns: No DA, No InSitu, No Sat
+
+Color scale:
+  Symmetric about zero
+  Uses global absolute max across ALL panels
+"""
+
+from __future__ import annotations
+
+import glob
+import os
+from netCDF4 import Dataset
+import numpy as np
+import matplotlib.pyplot as plt
+
+from matplotlib.colors import TwoSlopeNorm
+
+from wrf import (
+    getvar,
+    interplevel,
+    latlon_coords,
+    get_cartopy,
+    cartopy_xlim,
+    cartopy_ylim,
+)
+
+import cartopy.crs as ccrs
+
+
+# ----------------------------
+# USER CONFIG
+# ----------------------------
+DOMAIN = "d01"
+WRFOUT_GLOB = f"wrfout_{DOMAIN}_*"
+
+RUN_DIRS = {
+    "Full Data": "./fulldata",
+    "No DA": "./noda",
+    "No In-situ": "./noinsitu",
+    "No Sat": "./nosat",
+}
+
+BASELINE_LABEL = "Full Data"
+TRIAL_LABELS = ["No DA", "No In-situ", "No Sat"]
+LEVELS_HPA = [300.0, 500.0, 850.0]
+
+OUT_PNG = "dpot.png"
+
+
+# ----------------------------
+# HELPERS
+# ----------------------------
+def list_wrfout_files(run_dir: str):
+    files = sorted(glob.glob(os.path.join(run_dir, WRFOUT_GLOB)))
+    if not files:
+        raise FileNotFoundError(f"No files in {run_dir}")
+    return files
+
+
+def theta_3d(nc):
+    try:
+        return getvar(nc, "theta", timeidx=0)
+    except Exception:
+        tpert = getvar(nc, "T", timeidx=0)
+        return tpert + 300.0
+
+
+def theta_at_level(nc, level):
+    p = getvar(nc, "pressure", timeidx=0)
+    th = theta_3d(nc)
+    thL = interplevel(th, p, level)
+
+    if np.ma.isMaskedArray(thL):
+        return thL.filled(np.nan).astype(float)
+    return np.asarray(thL, dtype=float)
+
+
+# ----------------------------
+# MAIN
+# ----------------------------
+def main():
+
+    files = {k: list_wrfout_files(v) for k, v in RUN_DIRS.items()}
+    base_files = files[BASELINE_LABEL]
+    nt = len(base_files)
+
+    for trial in TRIAL_LABELS:
+        if len(files[trial]) != nt:
+            raise RuntimeError("File count mismatch.")
+
+    # Accumulator
+    acc = {
+        L: {trial: None for trial in TRIAL_LABELS}
+        for L in LEVELS_HPA
+    }
+
+    ref = None
+    lats = lons = cart_proj = None
+
+    print(f"Accumulating Σ Δθ across {nt} times...")
+
+    for i in range(nt):
+
+        with Dataset(base_files[i]) as nc_base:
+
+            if i == 0:
+                ref = getvar(nc_base, "T", timeidx=0)
+                lats, lons = latlon_coords(ref)
+                cart_proj = get_cartopy(ref)
+
+                shape_ref = theta_at_level(nc_base, LEVELS_HPA[0])
+                for L in LEVELS_HPA:
+                    for trial in TRIAL_LABELS:
+                        acc[L][trial] = np.zeros_like(shape_ref)
+
+            th_base = {L: theta_at_level(nc_base, L) for L in LEVELS_HPA}
+
+        for trial in TRIAL_LABELS:
+            with Dataset(files[trial][i]) as nc_trial:
+                for L in LEVELS_HPA:
+                    th_trial = theta_at_level(nc_trial, L)
+                    acc[L][trial] += np.nan_to_num(th_trial - th_base[L])
+
+        if (i + 1) % max(1, nt // 10) == 0:
+            print(f"  {i+1}/{nt}")
+
+    # ----------------------------
+    # GLOBAL SYMMETRIC LIMITS
+    # ----------------------------
+    all_vals = np.concatenate([
+        acc[L][trial].ravel()
+        for L in LEVELS_HPA
+        for trial in TRIAL_LABELS
+    ])
+
+    finite = all_vals[np.isfinite(all_vals)]
+    vmax = np.nanmax(np.abs(finite))
+    if not np.isfinite(vmax) or vmax == 0:
+        vmax = 1e-6
+
+    vmin = -vmax
+    norm = TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax)
+
+    # ----------------------------
+    # PLOTTING 3x3
+    # ----------------------------
+    fig = plt.figure(figsize=(14, 12), constrained_layout=True)
+    axes = []
+
+    for r, L in enumerate(LEVELS_HPA, start=1):
+        for c, trial in enumerate(TRIAL_LABELS, start=1):
+
+            ax = fig.add_subplot(
+                len(LEVELS_HPA),
+                len(TRIAL_LABELS),
+                (r - 1) * len(TRIAL_LABELS) + c,
+                projection=cart_proj,
+            )
+
+            axes.append(ax)
+
+            if c == 1:
+                ax.text(
+                    0.02, 0.98, f"{int(L)} hPa",
+                    transform=ax.transAxes,
+                    va="top", ha="left",
+                    fontsize=11,
+                    bbox=dict(facecolor="white", alpha=0.7, edgecolor="none")
+                )
+
+            if r == 1:
+                ax.set_title(trial)
+
+            cf = ax.contourf(
+                lons,
+                lats,
+                acc[L][trial],
+                levels=np.linspace(-150, 150, 175),
+                transform=ccrs.PlateCarree(),
+                cmap="RdBu_r",
+                norm=norm,
+                extend="both",
+            )
+
+            ax.set_xlim(cartopy_xlim(ref))
+            ax.set_ylim(cartopy_ylim(ref))
+            ax.coastlines(linewidth=0.8)
+
+    cbar = fig.colorbar(cf, ax=axes, orientation="vertical", pad=0.02)
+    cbar.set_label("Σ Δθ (K)")
+
+    fig.suptitle("Σ Δθ (Trial − Full Data)", fontsize=14)
+    fig.savefig(OUT_PNG, dpi=200)
+    plt.close(fig)
+
+    print(f"\nSaved: {OUT_PNG}")
+    print(f"Color limits: ±{vmax:.3f} K")
+
+
+if __name__ == "__main__":
+    main()

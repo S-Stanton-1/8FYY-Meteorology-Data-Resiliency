@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""
+3x3 QVAPOR difference summary:
+
+Compute streaming (low-memory) accumulation:
+  SUM_t [ QVAPOR@LEVEL(trial) - QVAPOR@LEVEL(fulldata) ]
+
+Levels (rows): 300, 500, 850 hPa (top to bottom)
+Trials (cols): No DA, No InSitu, No Sat (left to right)
+
+Directory layout (run from parent dir):
+  ./fulldata/wrfout_d0X_*
+  ./noda/wrfout_d0X_*
+  ./noinsitu/wrfout_d0X_*
+  ./nosat/wrfout_d0X_*
+
+Assumes: one time per wrfout file OR that timeidx=0 is the desired time.
+
+Output:
+  qvapor_sumdiff_3x3_levels_trials.png
+"""
+
+from __future__ import annotations
+
+import glob
+import os
+from netCDF4 import Dataset
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+from wrf import (
+    getvar,
+    interplevel,
+    latlon_coords,
+    get_cartopy,
+    cartopy_xlim,
+    cartopy_ylim,
+)
+
+import cartopy.crs as ccrs
+
+
+# ----------------------------
+# User config
+# ----------------------------
+DOMAIN = "d01"                 # change to d02 if desired
+WRFOUT_GLOB = f"wrfout_{DOMAIN}_*"
+
+RUN_DIRS = {
+    "Full Data": "./fulldata",
+    "No DA": "./noda",
+    "No In-situ": "./noinsitu",
+    "No Sat": "./nosat",
+}
+
+BASELINE_LABEL = "Full Data"
+TRIAL_LABELS = ["No DA", "No In-situ", "No Sat"]   # columns in the 3x3
+
+LEVELS_HPA = [300.0, 500.0, 850.0]               # rows in the 3x3 (top->bottom)
+
+OUT_PNG = "qvapor_sumdiff_3x3_levels_trials.png"
+
+SCALE_TO_G_PER_KG = True   # kg/kg -> g/kg
+ABS_PCTL = 99              # robust symmetric scaling percentile
+
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def list_wrfout_files(run_dir: str) -> list[str]:
+    files = sorted(glob.glob(os.path.join(run_dir, WRFOUT_GLOB)))
+    if not files:
+        raise FileNotFoundError(f"No files matched {WRFOUT_GLOB!r} in {run_dir!r}")
+    return files
+
+
+def get_time_string(nc: Dataset) -> str:
+    """Return the first WRF 'Times' value as a string."""
+    if "Times" not in nc.variables:
+        return "UNKNOWN_TIME"
+    t = nc.variables["Times"][0]
+    if hasattr(t, "tobytes"):
+        s = t.tobytes().decode("utf-8", errors="ignore")
+    else:
+        s = "".join(
+            [x.decode("utf-8") if isinstance(x, (bytes, np.bytes_)) else str(x) for x in t]
+        )
+    return s.strip()
+
+
+def qvapor_at_hpa_singlefile(nc: Dataset, level_hpa: float) -> np.ndarray:
+    """
+    QVAPOR interpolated to level_hpa (hPa) from a single wrfout Dataset.
+    Returns a 2D numpy array (float) with NaNs where invalid.
+    """
+    p = getvar(nc, "pressure", timeidx=0)   # hPa
+    qv = getvar(nc, "QVAPOR", timeidx=0)    # kg/kg
+    qL = interplevel(qv, p, level_hpa)      # kg/kg at pressure level
+
+    if np.ma.isMaskedArray(qL):
+        return qL.filled(np.nan).astype(float)
+    return np.asarray(qL, dtype=float)
+
+
+def robust_symmetric_limits(arrays: list[np.ndarray], abs_pctl: float) -> tuple[float, float]:
+    """Compute symmetric vmin/vmax from all arrays combined using percentile of |x|."""
+    all_vals = np.concatenate([a.ravel() for a in arrays])
+    finite = all_vals[np.isfinite(all_vals)]
+    if finite.size == 0:
+        raise RuntimeError("All accumulated differences are NaN/empty.")
+
+    vmax = np.nanpercentile(np.abs(finite), abs_pctl)
+    if not np.isfinite(vmax) or vmax <= 0:
+        vmax = np.nanmax(np.abs(finite))
+        if not np.isfinite(vmax) or vmax <= 0:
+            vmax = 1e-12
+    return -float(vmax), float(vmax)
+
+
+# ----------------------------
+# Main
+# ----------------------------
+def main() -> None:
+    # Build file lists
+    files = {lab: list_wrfout_files(d) for lab, d in RUN_DIRS.items()}
+    base_files = files[BASELINE_LABEL]
+    nt = len(base_files)
+
+    # Basic count consistency check (index-based pairing)
+    for trial in TRIAL_LABELS:
+        if len(files[trial]) != nt:
+            raise RuntimeError(
+                f"File count mismatch: {trial} has {len(files[trial])} files, baseline has {nt}."
+            )
+
+    # Accumulators: acc[level][trial] -> 2D float array
+    acc: dict[float, dict[str, np.ndarray]] = {L: {trial: None for trial in TRIAL_LABELS} for L in LEVELS_HPA}
+
+    # For map projection and coords
+    ref_for_proj = None
+    lats = lons = cart_proj = None
+
+    print(
+        f"Found {nt} times for DOMAIN={DOMAIN}. "
+        f"Accumulating Σ(trial - {BASELINE_LABEL}) for QVAPOR at levels {LEVELS_HPA} hPa..."
+    )
+
+    for i in range(nt):
+        # ---- baseline (fulldata) ----
+        with Dataset(base_files[i]) as nc_base:
+            t_base = get_time_string(nc_base)
+
+            if i == 0:
+                # Setup reference for projection/coords
+                ref_for_proj = getvar(nc_base, "QVAPOR", timeidx=0)
+                lats, lons = latlon_coords(ref_for_proj)
+                cart_proj = get_cartopy(ref_for_proj)
+
+                # Initialize accumulator shapes using first baseline level field
+                q_shape_ref = qvapor_at_hpa_singlefile(nc_base, LEVELS_HPA[0])
+                for L in LEVELS_HPA:
+                    for trial in TRIAL_LABELS:
+                        acc[L][trial] = np.zeros_like(q_shape_ref, dtype=float)
+
+            # Baseline fields for each level (compute once per time)
+            q_base = {L: qvapor_at_hpa_singlefile(nc_base, L) for L in LEVELS_HPA}
+
+        # ---- trials ----
+        for trial in TRIAL_LABELS:
+            with Dataset(files[trial][i]) as nc_trial:
+                t_trial = get_time_string(nc_trial)
+                if t_trial != t_base:
+                    raise RuntimeError(
+                        f"Time mismatch at index {i}:\n"
+                        f"  baseline: {t_base}\n"
+                        f"  {trial}: {t_trial}\n"
+                        f"Files:\n  {base_files[i]}\n  {files[trial][i]}"
+                    )
+
+                for L in LEVELS_HPA:
+                    q_trial = qvapor_at_hpa_singlefile(nc_trial, L)
+                    diff = q_trial - q_base[L]
+                    acc[L][trial] += np.nan_to_num(diff, nan=0.0)
+
+        if (i + 1) % max(1, nt // 10) == 0:
+            print(f"  {i+1}/{nt} times processed")
+
+        # encourage GC
+        del q_base, q_trial, diff
+
+    # Convert units for display
+    if SCALE_TO_G_PER_KG:
+        for L in LEVELS_HPA:
+            for trial in TRIAL_LABELS:
+                acc[L][trial] *= 1000.0
+        cbar_label = "Σ ΔQVAPOR (g/kg)"
+    else:
+        cbar_label = "Σ ΔQVAPOR (kg/kg)"
+
+    # Shared symmetric color scale across ALL 9 panels
+    all_arrays = [acc[L][trial] for L in LEVELS_HPA for trial in TRIAL_LABELS]
+    vmin, vmax = robust_symmetric_limits(all_arrays, ABS_PCTL)
+
+    # ---- Plot: 3x3 (rows=levels, cols=trials) ----
+    fig = plt.figure(figsize=(14, 12), constrained_layout=True)
+
+    axes = []
+    cf = None
+
+    # Row order explicitly: 300 top -> 850 bottom
+    for r, L in enumerate(LEVELS_HPA, start=1):
+        for c, trial in enumerate(TRIAL_LABELS, start=1):
+            ax = fig.add_subplot(len(LEVELS_HPA), len(TRIAL_LABELS), (r - 1) * len(TRIAL_LABELS) + c, projection=cart_proj)
+            axes.append(ax)
+
+            # Titles: only put level on left, trial on top (less clutter)
+            if c == 1:
+                ax.text(0.02, 0.98, f"{int(L)} hPa", transform=ax.transAxes, va="top", ha="left",
+                        fontsize=11, bbox=dict(facecolor="white", alpha=0.6, edgecolor="none", pad=1.5))
+            if r == 1:
+                ax.set_title(trial, fontsize=12)
+
+            cf = ax.contourf(
+                lons,
+                lats,
+                acc[L][trial],
+                levels=21,
+                transform=ccrs.PlateCarree(),
+                vmin=vmin,
+                vmax=vmax,
+                cmap="RdBu",
+                extend="both",
+            )
+
+            ax.set_xlim(cartopy_xlim(ref_for_proj))
+            ax.set_ylim(cartopy_ylim(ref_for_proj))
+            ax.coastlines(linewidth=0.8)
+
+    # Shared colorbar for all panels
+    cbar = fig.colorbar(
+        cf,
+        ax=axes,
+        orientation="vertical",
+        shrink=0.95,
+        pad=0.02,
+    )
+    cbar.set_label(cbar_label)
+
+    fig.suptitle(
+        "Σ ΔQVAPOR (Trial − Full Data)",
+        fontsize=14
+    )
+
+    fig.savefig(OUT_PNG, dpi=200)
+    plt.close(fig)
+
+    print(f"✅ Wrote {OUT_PNG}")
+    print(f"Shared color limits: vmin={vmin:.3g}, vmax={vmax:.3g} ({'g/kg' if SCALE_TO_G_PER_KG else 'kg/kg'})")
+
+
+if __name__ == "__main__":
+    main()
